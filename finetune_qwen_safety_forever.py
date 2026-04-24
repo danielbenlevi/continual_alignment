@@ -180,6 +180,7 @@ class ReplayTrainer(MyTrainer):
         beta_t: float,
         theta_star: dict,
         importance: dict,
+        kl_theta_star: Optional[dict] = None,
         early_layer_boost_factor: float = 1.0,
         early_layer_count: int = 0,
         use_token_kl_loss: bool = False,
@@ -192,6 +193,7 @@ class ReplayTrainer(MyTrainer):
         self.beta_t = beta_t
         self.theta_star = theta_star
         self.importance = importance
+        self.kl_theta_star = kl_theta_star
         self.early_layer_boost_factor = float(early_layer_boost_factor)
         self.early_layer_count = int(early_layer_count)
         self.use_token_kl_loss = bool(use_token_kl_loss)
@@ -207,10 +209,11 @@ class ReplayTrainer(MyTrainer):
     def _reference_logits(self, model, inputs) -> torch.Tensor:
         # Build a "reference" forward pass by swapping trainable params to theta*.
         trainable_params = dict(model.named_parameters())
+        ref_params = self.kl_theta_star if self.kl_theta_star is not None else self.theta_star
         backups: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
             try:
-                for name, ref_param in self.theta_star.items():
+                for name, ref_param in ref_params.items():
                     param = trainable_params.get(name)
                     if param is None:
                         continue
@@ -631,6 +634,35 @@ def _build_memory_buffer(history_train_sets: Sequence[Dataset], memory_data_rati
     return concatenate_datasets(sampled)
 
 
+def _snapshot_trainable_params(model) -> Dict[str, torch.Tensor]:
+    return {
+        name: param.detach().clone().cpu()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def _get_t1_reference_path(output_path: str, model_name: str) -> Path:
+    return Path(output_path) / f"{model_name}_clmm_safety_forever" / "t1_safety_reference.pt"
+
+
+def _save_t1_reference(path: Path, theta_star: Dict[str, torch.Tensor], importance: Dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"theta_star": theta_star, "importance": importance}
+    torch.save(payload, str(path))
+
+
+def _load_t1_reference(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Optional[Dict[str, float]]]:
+    if not path.exists():
+        return None, None
+    payload = torch.load(str(path), map_location="cpu")
+    theta_star = payload.get("theta_star")
+    importance = payload.get("importance")
+    if not isinstance(theta_star, dict) or not isinstance(importance, dict):
+        return None, None
+    return theta_star, importance
+
+
 def _build_prompt_pair(prompter: Prompter, data_point: dict) -> Tuple[str, str]:
     if "instruction" in data_point and "output" in data_point:
         instruction = data_point.get("instruction", "")
@@ -855,6 +887,20 @@ def _run_task_training(
         if param.requires_grad
     }
 
+    t1_reference_path = _get_t1_reference_path(output_path, model_name)
+    t1_theta_star = None
+    t1_importance = None
+    if task_id > 0 and (enable_safety_layer_reg_boost or enable_safety_token_kl):
+        t1_theta_star, t1_importance = _load_t1_reference(t1_reference_path)
+        if t1_theta_star is None or t1_importance is None:
+            print(
+                f"[safety_ref] Missing/invalid T1 reference at {t1_reference_path}; "
+                f"falling back to per-task reference."
+            )
+            t1_theta_star, t1_importance = None, None
+        else:
+            print(f"[safety_ref] Loaded T1 safety reference from {t1_reference_path}")
+
     per_device_train_batch_size = micro_batch_size
     gradient_accumulation_steps = batch_size // micro_batch_size
     if ddp:
@@ -1028,8 +1074,35 @@ def _run_task_training(
 
             trainer_memory = ReplayTrainer(
                 beta_t=beta_t,
-                theta_star=theta_star,
-                importance=importance,
+                theta_star=(
+                    t1_theta_star
+                    if (
+                        use_safety_heuristics
+                        and enable_safety_layer_reg_boost
+                        and t1_theta_star is not None
+                        and t1_importance is not None
+                    )
+                    else theta_star
+                ),
+                importance=(
+                    t1_importance
+                    if (
+                        use_safety_heuristics
+                        and enable_safety_layer_reg_boost
+                        and t1_theta_star is not None
+                        and t1_importance is not None
+                    )
+                    else importance
+                ),
+                kl_theta_star=(
+                    t1_theta_star
+                    if (
+                        use_safety_heuristics
+                        and enable_safety_token_kl
+                        and t1_theta_star is not None
+                    )
+                    else None
+                ),
                 early_layer_boost_factor=(
                     safety_layer_reg_boost_factor
                     if (use_safety_heuristics and enable_safety_layer_reg_boost)
@@ -1244,6 +1317,12 @@ def _run_task_training(
 
         model.save_pretrained(output_dir)
         print("[Scheduler] Final replay completed and model saved.")
+
+    if task_id == 0:
+        t1_theta = _snapshot_trainable_params(model)
+        t1_importance = {name: 1.0 for name in t1_theta}
+        _save_t1_reference(t1_reference_path, t1_theta, t1_importance)
+        print(f"[safety_ref] Saved T1 safety reference to {t1_reference_path}")
 
     return model, tokenizer, output_dir
 
