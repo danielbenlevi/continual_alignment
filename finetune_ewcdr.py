@@ -7,7 +7,6 @@ os.makedirs(HF_CACHE_DIR, exist_ok=True)
 import gc
 import json
 import re
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -24,19 +23,32 @@ from transformers import set_seed
 AutoConfig.default_cache_dir = HF_CACHE_DIR
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FOREVER_ROOT = REPO_ROOT / "FOREVER"
-CLMM_ROOT = REPO_ROOT / "clmm-project"
-for p in (str(FOREVER_ROOT), str(CLMM_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-from utils.prompter import Prompter  # noqa: E402
-from safety_clora.data.data_utils import (  # noqa: E402
-    load_advbench_harmful,
-    load_alignment_sft_dataset,
-)
-from safety_clora.evaluation.safety_eval import compute_rouge_l  # noqa: E402
-from safety_clora.training.trainer import load_task_dataset  # noqa: E402
+try:  # noqa: E402
+    from our_scripts.data_helpers import (
+        load_advbench_harmful,
+        load_alignment_sft_dataset,
+        load_task_dataset,
+    )
+    from our_scripts.eval_helpers import (
+        compute_rouge_l,
+        extract_sst2_label,
+        pick_canonical_sciq_answer,
+        sciq_answer_in_text,
+    )
+except ModuleNotFoundError as exc:  # noqa: E402
+    if exc.name != "our_scripts":
+        raise
+    from data_helpers import (  # type: ignore
+        load_advbench_harmful,
+        load_alignment_sft_dataset,
+        load_task_dataset,
+    )
+    from eval_helpers import (  # type: ignore
+        compute_rouge_l,
+        extract_sst2_label,
+        pick_canonical_sciq_answer,
+        sciq_answer_in_text,
+    )
 
 set_seed(42)
 
@@ -47,15 +59,6 @@ def _resolve_report_to(wandb_project: str) -> str:
     os.environ.setdefault("WANDB_DISABLED", "true")
     os.environ.setdefault("WANDB_MODE", "disabled")
     return "none"
-
-
-def _build_prompter(template_name: str) -> Prompter:
-    prev_cwd = os.getcwd()
-    try:
-        os.chdir(str(FOREVER_ROOT))
-        return Prompter(template_name)
-    finally:
-        os.chdir(prev_cwd)
 
 
 def _normalize_chat_template_mode(chat_template_mode: str) -> str:
@@ -185,6 +188,8 @@ REFUSAL_KEYWORDS = [
 _NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _ASSISTANT_PREFIX_RE = re.compile(r"^\s*assistant\s*:?\s*", re.IGNORECASE)
+_ALPACA_INSTR_RE = re.compile(r"^\s*#{3}\s*Instruction\s*:\s*", re.IGNORECASE)
+_ALPACA_RESP_RE = re.compile(r"\s*#{3}\s*Response\s*:\s*", re.IGNORECASE)
 
 TASK_REGISTRY = {
     "gsm8k": dict(load_split="train", eval_type="gsm8k"),
@@ -192,17 +197,30 @@ TASK_REGISTRY = {
     "mbpp": dict(load_split="train", eval_type="mbpp"),
     "agnews": dict(load_split="train", eval_type="agnews"),
     "xsum": dict(load_split="train", eval_type="generation"),
-    "sciq": dict(load_split="train", eval_type="generation"),
+    "sciq": dict(load_split="train", eval_type="sciq"),
     "multiwoz": dict(load_split="train", eval_type="generation"),
 }
-GENERATION_TASKS = {"xsum", "sciq", "multiwoz"}
+GENERATION_TASKS = {"xsum", "multiwoz"}
 
 
 def _format_eval_prompt(tokenizer, prompt: str) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
-        messages = [{"role": "user", "content": prompt}]
+        user_text = _strip_alpaca_scaffold(str(prompt))
+        messages = [{"role": "user", "content": user_text}]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return f"### Instruction:\n{prompt}\n\n### Response:\n"
+    p = str(prompt).strip()
+    if _ALPACA_RESP_RE.search(p):
+        return p
+    return f"### Instruction:\n{p}\n\n### Response:\n"
+
+
+def _strip_alpaca_scaffold(text: str) -> str:
+    s = (text or "").strip()
+    s = _ALPACA_INSTR_RE.sub("", s)
+    m = _ALPACA_RESP_RE.search(s)
+    if m:
+        s = s[: m.start()].strip()
+    return s
 
 
 def _clean_response_text(text: str) -> str:
@@ -369,12 +387,8 @@ def _evaluate_task_performance_batched(
                 pred = ""
                 ok = False
                 if task_type == "sst2":
-                    pred = (
-                        "positive"
-                        if "positive" in parse_text.lower()
-                        else ("negative" if "negative" in parse_text.lower() else "")
-                    )
-                    label = "positive" if "positive" in gt.lower() else "negative"
+                    pred = extract_sst2_label(parse_text)
+                    label = extract_sst2_label(str(chunk[idx].get("output_canonical", gt)))
                     ok = pred == label
                 elif task_type == "agnews":
                     labels = ["world", "sports", "business", "technology"]
@@ -384,6 +398,10 @@ def _evaluate_task_performance_batched(
                 elif task_type == "mbpp":
                     ok = _mbpp_code_match(resp_clean, gt)
                     pred = resp_clean
+                elif task_type == "sciq":
+                    gt_canonical = pick_canonical_sciq_answer(chunk[idx])
+                    pred = parse_text
+                    ok = sciq_answer_in_text(parse_text, gt_canonical)
                 else:
                     pred_num = _extract_last_number(parse_text)
                     gt_num = _extract_last_number(gt)
@@ -530,23 +548,24 @@ def _chat_user_text_from_point(data_point: dict) -> str:
         if instruction and inp:
             return f"{instruction}\n\n{inp}"
         return instruction or inp
-    return str(data_point.get("input", ""))
+    return _strip_alpaca_scaffold(str(data_point.get("input", "")))
 
 
 def _tokenize_example_builder(
     tokenizer,
-    prompter,
     max_input_length: int,
     train_on_inputs: bool,
     add_eos_token: bool,
     use_chat_template: bool,
 ):
     def build_prompt_pair(data_point: dict) -> Tuple[str, str]:
-        full_prompt = prompter.generate_prompt(
-            data_point["input"],
-            data_point["output"],
-        )
-        user_prompt = prompter.generate_prompt(data_point["input"], None)
+        raw_prompt = str(data_point.get("input", "")).strip()
+        if _ALPACA_RESP_RE.search(raw_prompt):
+            user_prompt = raw_prompt
+        else:
+            user_prompt = f"### Instruction:\n{raw_prompt}\n\n### Response:\n"
+        out = str(data_point.get("output", ""))
+        full_prompt = f"{user_prompt}{out}"
         return user_prompt, full_prompt
 
     def tokenize(prompt: str):
@@ -569,8 +588,8 @@ def _tokenize_example_builder(
 
     def generate_and_tokenize_prompt(data_point):
         if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-            # Match clmm-project chat formatting exactly: build chat prompt that ends at
-            # assistant start, then append assistant text manually and mask prompt tokens.
+            # Build a chat-formatted prompt that ends at assistant start, then append
+            # assistant text manually and mask prompt tokens.
             prompt = _chat_user_text_from_point(data_point)
             answer = str(data_point.get("output", ""))
 
@@ -933,10 +952,8 @@ def train(
     _prepare_tokenizer_and_model(tokenizer, model)
     print(f"[prompting] use_chat_template={use_chat_template} (mode={chat_template_mode})")
 
-    prompter = _build_prompter(prompt_template_name)
     generate_and_tokenize_prompt = _tokenize_example_builder(
         tokenizer=tokenizer,
-        prompter=prompter,
         max_input_length=max_input_length,
         train_on_inputs=train_on_inputs,
         add_eos_token=add_eos_token,

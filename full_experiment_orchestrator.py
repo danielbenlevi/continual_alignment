@@ -269,13 +269,90 @@ def _resolve_python(python_value: str) -> str:
     return found
 
 
+def _job_from_manifest_entry(entry: Dict[str, Any]) -> JobSpec:
+    base_model = str(entry["base_model"])
+    seed = int(entry["seed"])
+    return JobSpec(
+        job_id=str(entry["job_id"]),
+        experiment_key=str(entry["experiment_key"]),
+        script_path=Path(str(entry["script_path"])),
+        base_model=base_model,
+        model_alias=_model_alias(base_model),
+        seed=seed,
+        output_path=Path(str(entry["output_path"])),
+        results_json=Path(str(entry["results_json"])),
+        fire_args=dict(entry["fire_args"]),
+    )
+
+
+def _load_jobs_from_manifest(manifest_path: Path) -> Tuple[Dict[str, Any], List[JobSpec]]:
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    jobs_raw = manifest.get("jobs")
+    if not isinstance(jobs_raw, list) or not jobs_raw:
+        raise ValueError(f"Manifest has no jobs: {manifest_path}")
+    jobs = [_job_from_manifest_entry(x) for x in jobs_raw]
+    return manifest, jobs
+
+
+def _is_job_completed(results_json: Path) -> bool:
+    if not results_json.exists():
+        return False
+    try:
+        with results_json.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return False
+    stages = payload.get("stages")
+    return isinstance(stages, list) and len(stages) > 0
+
+
+def _safe_remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _cleanup_incomplete_job(run_root: Path, job: JobSpec) -> None:
+    _safe_remove_path(job.output_path)
+    _safe_remove_path(job.results_json)
+    _safe_remove_path(run_root / "jobs" / job.job_id)
+
+
+def _find_latest_run_root(runs_root: Path, run_name_prefix: str) -> Path:
+    prefix = _sanitize_slug(run_name_prefix)
+    candidates = [p for p in runs_root.glob(f"{prefix}_*") if p.is_dir() and (p / "manifest.json").exists()]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No prior runs found under {runs_root} matching '{prefix}_*' with a manifest.json."
+        )
+    # Directory names include sortable timestamps: {prefix}_YYYYmmdd_HHMMSS
+    return sorted(candidates, key=lambda p: p.name)[-1]
+
+
+def _is_port_bind_collision(stderr_path: str) -> bool:
+    path = Path(stderr_path)
+    if not path.exists():
+        return False
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    has_addr_collision = ("EADDRINUSE" in txt) or ("address already in use" in txt)
+    has_dist_context = ("DistNetworkError" in txt) or ("TCPStore" in txt)
+    return has_addr_collision and has_dist_context
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run full continual-learning experiment suite across available GPUs with queue backfilling."
         )
     )
-    parser.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU ids, e.g. 0,1,2")
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU ids, e.g. 0,1,2")
     parser.add_argument(
         "--models",
         type=str,
@@ -287,55 +364,119 @@ def main() -> int:
     parser.add_argument("--runs-root", type=str, default="./orchestrator_runs", help="Output root folder.")
     parser.add_argument("--run-name-prefix", type=str, default="full_suite", help="Run folder name prefix.")
     parser.add_argument("--poll-seconds", type=float, default=20.0, help="Polling interval in seconds.")
+    parser.add_argument(
+        "--max-port-retries",
+        type=int,
+        default=2,
+        help="Retries for transient torch TCPStore port-collision failures (EADDRINUSE).",
+    )
+    parser.add_argument(
+        "--complete-last",
+        action="store_true",
+        help=(
+            "Resume the most recent prior run folder for this prefix: keep completed jobs, "
+            "rerun incomplete jobs from scratch, and finish remaining jobs."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Only write the manifest and print commands.")
     args = parser.parse_args()
 
-    gpus = _parse_gpus(args.gpus)
-    models = _parse_csv_strs(args.models)
-    seeds = _parse_csv_ints(args.seeds)
-
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
-    experiments = _build_experiments(script_dir)
+    pending: List[JobSpec] = []
+    completed: List[Dict[str, Any]] = []
 
-    ts = _now_tag()
-    run_root = Path(args.runs_root).resolve() / f"{_sanitize_slug(args.run_name_prefix)}_{ts}"
-    run_root.mkdir(parents=True, exist_ok=True)
+    if args.complete_last:
+        runs_root = Path(args.runs_root).resolve()
+        run_root = _find_latest_run_root(runs_root, args.run_name_prefix)
+        manifest_path = run_root / "manifest.json"
+        manifest, jobs = _load_jobs_from_manifest(manifest_path)
 
-    jobs = _build_jobs(experiments=experiments, models=models, seeds=seeds, run_root=run_root)
-    manifest = {
-        "timestamp": ts,
-        "run_root": str(run_root),
-        "repo_root": str(repo_root),
-        "gpus": gpus,
-        "models": models,
-        "seeds": seeds,
-        "poll_seconds": float(args.poll_seconds),
-        "num_experiments": len(experiments),
-        "num_jobs": len(jobs),
-        "experiments": [
-            {
-                "key": exp.key,
-                "script_path": str(exp.script_path),
-                "fire_args": exp.fire_args,
-            }
-            for exp in experiments
-        ],
-        "jobs": [
-            {
-                "job_id": job.job_id,
-                "experiment_key": job.experiment_key,
-                "script_path": str(job.script_path),
-                "base_model": job.base_model,
-                "seed": int(job.seed),
-                "output_path": str(job.output_path),
-                "results_json": str(job.results_json),
-                "fire_args": job.fire_args,
-            }
-            for job in jobs
-        ],
-    }
-    _write_json(run_root / "manifest.json", manifest)
+        if args.gpus:
+            gpus = _parse_gpus(args.gpus)
+        else:
+            manifest_gpus = manifest.get("gpus")
+            if not isinstance(manifest_gpus, list) or not manifest_gpus:
+                raise ValueError(
+                    f"Manifest is missing a valid non-empty 'gpus' list: {manifest_path}"
+                )
+            gpus = _parse_gpus(",".join(str(x) for x in manifest_gpus))
+
+        for job in jobs:
+            if _is_job_completed(job.results_json):
+                completed.append(
+                    {
+                        "job_id": job.job_id,
+                        "experiment_key": job.experiment_key,
+                        "base_model": job.base_model,
+                        "seed": int(job.seed),
+                        "gpu_id": None,
+                        "pid": None,
+                        "returncode": 0,
+                        "elapsed_sec": None,
+                        "stdout": None,
+                        "stderr": None,
+                        "output_path": str(job.output_path),
+                        "results_json": str(job.results_json),
+                        "preexisting_completed": True,
+                    }
+                )
+            else:
+                pending.append(job)
+
+        if not args.dry_run:
+            for job in pending:
+                _cleanup_incomplete_job(run_root, job)
+
+        print(
+            f"[orchestrator] resuming run_root={run_root} | total={len(jobs)} "
+            f"already_completed={len(completed)} pending={len(pending)}"
+        )
+    else:
+        gpus = _parse_gpus(args.gpus or "0")
+        models = _parse_csv_strs(args.models)
+        seeds = _parse_csv_ints(args.seeds)
+        experiments = _build_experiments(script_dir)
+
+        ts = _now_tag()
+        run_root = Path(args.runs_root).resolve() / f"{_sanitize_slug(args.run_name_prefix)}_{ts}"
+        run_root.mkdir(parents=True, exist_ok=True)
+
+        jobs = _build_jobs(experiments=experiments, models=models, seeds=seeds, run_root=run_root)
+        manifest = {
+            "timestamp": ts,
+            "run_root": str(run_root),
+            "repo_root": str(repo_root),
+            "gpus": gpus,
+            "models": models,
+            "seeds": seeds,
+            "poll_seconds": float(args.poll_seconds),
+            "num_experiments": len(experiments),
+            "num_jobs": len(jobs),
+            "experiments": [
+                {
+                    "key": exp.key,
+                    "script_path": str(exp.script_path),
+                    "fire_args": exp.fire_args,
+                }
+                for exp in experiments
+            ],
+            "jobs": [
+                {
+                    "job_id": job.job_id,
+                    "experiment_key": job.experiment_key,
+                    "script_path": str(job.script_path),
+                    "base_model": job.base_model,
+                    "seed": int(job.seed),
+                    "output_path": str(job.output_path),
+                    "results_json": str(job.results_json),
+                    "fire_args": job.fire_args,
+                }
+                for job in jobs
+            ],
+        }
+        _write_json(run_root / "manifest.json", manifest)
+        pending = list(jobs)
 
     python_exe = _resolve_python(args.python)
 
@@ -344,17 +485,17 @@ def main() -> int:
     print(f"[orchestrator] jobs={len(jobs)} | gpus={gpus}")
 
     if args.dry_run:
-        for j in jobs:
+        for j in pending:
             cmd = [python_exe, str(j.script_path)] + [_fire_arg(k, v) for k, v in j.fire_args.items()]
             print(shlex.join(cmd))
         print("[orchestrator] dry-run complete")
         return 0
 
-    pending = list(jobs)
     running: Dict[str, Dict[str, Any]] = {}
-    completed: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     next_gpu_idx = 0
+    max_port_retries = max(0, int(args.max_port_retries))
+    retry_counts: Dict[str, int] = {job.job_id: 0 for job in jobs}
 
     def pick_next_free_gpu() -> Tuple[Optional[str], int]:
         nonlocal next_gpu_idx
@@ -399,6 +540,22 @@ def main() -> int:
 
                 elapsed = time.time() - float(info["start_time"])
                 job = info["job"]
+                info["_stdout_handle"].close()
+                info["_stderr_handle"].close()
+
+                if int(rc) != 0:
+                    retry_count = int(retry_counts.get(job.job_id, 0))
+                    if retry_count < max_port_retries and _is_port_bind_collision(info["stderr"]):
+                        retry_counts[job.job_id] = retry_count + 1
+                        _cleanup_incomplete_job(run_root, job)
+                        pending.insert(0, job)
+                        print(
+                            f"[orchestrator] retrying job={job.job_id} after EADDRINUSE "
+                            f"(attempt {retry_counts[job.job_id]}/{max_port_retries})"
+                        )
+                        finished_gpus.append(gpu)
+                        continue
+
                 result = {
                     "job_id": job.job_id,
                     "experiment_key": job.experiment_key,
@@ -420,8 +577,6 @@ def main() -> int:
                 else:
                     print(f"[orchestrator] finished job={job.job_id} gpu={gpu} rc=0")
 
-                info["_stdout_handle"].close()
-                info["_stderr_handle"].close()
                 finished_gpus.append(gpu)
 
             for gpu in finished_gpus:

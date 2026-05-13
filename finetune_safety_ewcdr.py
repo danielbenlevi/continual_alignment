@@ -10,7 +10,7 @@ except ModuleNotFoundError as exc:
 
 def train(*args, **kwargs):
     kwargs.setdefault("safety_task1_upweight", True)
-    kwargs.setdefault("safety_lamda_multiplier", 1.5)
+    kwargs.setdefault("safety_lamda_multiplier", 0.5)
     return _base_train(*args, **kwargs)
 
 
