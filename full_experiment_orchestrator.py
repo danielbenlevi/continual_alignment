@@ -58,6 +58,21 @@ def _model_alias(model_name: str) -> str:
     return _sanitize_slug(str(model_name).split("/")[-1])
 
 
+def _is_base_model_name(model_name: str) -> bool:
+    name = str(model_name).strip().lower()
+    if not name:
+        return False
+    if ("instruct" in name) or ("chat" in name):
+        return False
+    leaf = name.split("/")[-1]
+    return (
+        leaf.endswith("-base")
+        or leaf.endswith("_base")
+        or ("-base-" in leaf)
+        or ("_base_" in leaf)
+    )
+
+
 def _parse_csv_ints(raw: str) -> List[int]:
     vals = []
     for part in str(raw).split(","):
@@ -137,7 +152,7 @@ def _build_jobs(
                 fire_args: Dict[str, Any] = {
                     "base_model": model,
                     "seed": int(seed),
-                    "chat_template_mode": "auto",
+                    "chat_template_mode": "never" if _is_base_model_name(model) else "auto",
                     "output_path": str(output_path),
                     "results_json": str(results_json),
                     "wandb_run_name": job_id,
@@ -180,10 +195,18 @@ def _prepare_env(gpu_id: str, master_port: int) -> Dict[str, str]:
     return env
 
 
+def _world_size_for_model(base_model: str) -> int:
+    model_name = str(base_model).lower()
+    if "llama" in model_name:
+        return 2
+    return 1
+
+
 def _launch_job(
     *,
     job: JobSpec,
-    gpu_id: str,
+    gpu_ids: Sequence[str],
+    world_size: int,
     run_root: Path,
     repo_root: Path,
     python_exe: str,
@@ -192,9 +215,30 @@ def _launch_job(
     logs_dir = job_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [python_exe, str(job.script_path)] + [_fire_arg(k, v) for k, v in job.fire_args.items()]
+    if len(gpu_ids) != int(world_size):
+        raise ValueError(
+            f"world_size={world_size} must match allocated GPUs={list(gpu_ids)} for job={job.job_id}"
+        )
+
+    base_cmd = [str(job.script_path)] + [_fire_arg(k, v) for k, v in job.fire_args.items()]
     master_port = _pick_master_port()
-    env = _prepare_env(gpu_id, master_port)
+    master_addr = "127.0.0.1"
+    if int(world_size) > 1:
+        cmd = [
+            python_exe,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc_per_node={int(world_size)}",
+            f"--master_addr={master_addr}",
+            f"--master_port={int(master_port)}",
+        ] + base_cmd
+    else:
+        cmd = [python_exe] + base_cmd
+    env = _prepare_env(",".join(str(g) for g in gpu_ids), master_port)
+    env["WORLD_SIZE"] = str(int(world_size))
+    env["MASTER_ADDR"] = master_addr
+    env.pop("RANK", None)
+    env.pop("LOCAL_RANK", None)
 
     stdout_path = logs_dir / "stdout.log"
     stderr_path = logs_dir / "stderr.log"
@@ -203,7 +247,8 @@ def _launch_job(
     _write_json(
         logs_dir / "launch_env.json",
         {
-            "gpu_id": str(gpu_id),
+            "gpu_ids": [str(g) for g in gpu_ids],
+            "world_size": int(world_size),
             "cwd": str(repo_root),
             "CUDA_VISIBLE_DEVICES": env.get("CUDA_VISIBLE_DEVICES"),
             "WORLD_SIZE": env.get("WORLD_SIZE"),
@@ -237,7 +282,8 @@ def _launch_job(
             "seed": int(job.seed),
             "output_path": str(job.output_path),
             "results_json": str(job.results_json),
-            "gpu_id": str(gpu_id),
+            "gpu_ids": [str(g) for g in gpu_ids],
+            "world_size": int(world_size),
             "master_addr": env.get("MASTER_ADDR"),
             "master_port": env.get("MASTER_PORT"),
             "pid": int(proc.pid),
@@ -247,7 +293,8 @@ def _launch_job(
 
     return {
         "job": job,
-        "gpu_id": str(gpu_id),
+        "gpu_ids": [str(g) for g in gpu_ids],
+        "world_size": int(world_size),
         "proc": proc,
         "pid": int(proc.pid),
         "stdout": str(stdout_path),
@@ -497,33 +544,48 @@ def main() -> int:
     max_port_retries = max(0, int(args.max_port_retries))
     retry_counts: Dict[str, int] = {job.job_id: 0 for job in jobs}
 
-    def pick_next_free_gpu() -> Tuple[Optional[str], int]:
+    def pick_next_free_gpus(required_world_size: int) -> Tuple[Optional[List[str]], int]:
         nonlocal next_gpu_idx
+        if required_world_size <= 0 or required_world_size > len(gpus):
+            return None, next_gpu_idx
+
+        used_gpus = set()
+        for info in running.values():
+            for gpu in info.get("gpu_ids", []):
+                used_gpus.add(str(gpu))
+
         for offset in range(len(gpus)):
             idx = (next_gpu_idx + offset) % len(gpus)
-            gpu = gpus[idx]
-            if gpu not in running:
-                return gpu, (idx + 1) % len(gpus)
+            ordered = gpus[idx:] + gpus[:idx]
+            free = [gpu for gpu in ordered if gpu not in used_gpus]
+            if len(free) >= required_world_size:
+                selected = free[:required_world_size]
+                selected_last_pos = max(ordered.index(x) for x in selected)
+                return selected, (idx + selected_last_pos + 1) % len(gpus)
         return None, next_gpu_idx
 
     try:
         while pending or running:
             while pending:
-                gpu, proposed_idx = pick_next_free_gpu()
-                if gpu is None:
+                job = pending[0]
+                world_size = _world_size_for_model(job.base_model)
+                gpu_ids, proposed_idx = pick_next_free_gpus(world_size)
+                if gpu_ids is None:
                     break
                 next_gpu_idx = proposed_idx
-                job = pending.pop(0)
+                pending.pop(0)
                 info = _launch_job(
                     job=job,
-                    gpu_id=gpu,
+                    gpu_ids=gpu_ids,
+                    world_size=world_size,
                     run_root=run_root,
                     repo_root=repo_root,
                     python_exe=python_exe,
                 )
-                running[gpu] = info
+                running[job.job_id] = info
                 print(
-                    f"[orchestrator] launched job={job.job_id} gpu={gpu} pid={info['pid']} "
+                    f"[orchestrator] launched job={job.job_id} gpus={','.join(gpu_ids)} "
+                    f"world_size={world_size} pid={info['pid']} "
                     f"remaining={len(pending)}"
                 )
 
@@ -531,9 +593,9 @@ def main() -> int:
                 break
 
             time.sleep(max(0.5, float(args.poll_seconds)))
-            finished_gpus: List[str] = []
+            finished_jobs: List[str] = []
 
-            for gpu, info in list(running.items()):
+            for running_job_id, info in list(running.items()):
                 rc = info["proc"].poll()
                 if rc is None:
                     continue
@@ -553,7 +615,7 @@ def main() -> int:
                             f"[orchestrator] retrying job={job.job_id} after EADDRINUSE "
                             f"(attempt {retry_counts[job.job_id]}/{max_port_retries})"
                         )
-                        finished_gpus.append(gpu)
+                        finished_jobs.append(running_job_id)
                         continue
 
                 result = {
@@ -561,7 +623,8 @@ def main() -> int:
                     "experiment_key": job.experiment_key,
                     "base_model": job.base_model,
                     "seed": int(job.seed),
-                    "gpu_id": str(gpu),
+                    "gpu_ids": [str(g) for g in info.get("gpu_ids", [])],
+                    "world_size": int(info.get("world_size", 1)),
                     "pid": int(info["pid"]),
                     "returncode": int(rc),
                     "elapsed_sec": float(elapsed),
@@ -573,14 +636,20 @@ def main() -> int:
                 completed.append(result)
                 if int(rc) != 0:
                     failures.append(result)
-                    print(f"[orchestrator] FAILED job={job.job_id} gpu={gpu} rc={rc}")
+                    print(
+                        f"[orchestrator] FAILED job={job.job_id} "
+                        f"gpus={','.join(result['gpu_ids'])} rc={rc}"
+                    )
                 else:
-                    print(f"[orchestrator] finished job={job.job_id} gpu={gpu} rc=0")
+                    print(
+                        f"[orchestrator] finished job={job.job_id} "
+                        f"gpus={','.join(result['gpu_ids'])} rc=0"
+                    )
 
-                finished_gpus.append(gpu)
+                finished_jobs.append(running_job_id)
 
-            for gpu in finished_gpus:
-                running.pop(gpu, None)
+            for running_job_id in finished_jobs:
+                running.pop(running_job_id, None)
 
     except KeyboardInterrupt:
         print("[orchestrator] interrupt received; terminating running jobs")
