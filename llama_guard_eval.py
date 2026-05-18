@@ -18,6 +18,8 @@ RUN_ROOTS = {
     "qwen": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/updated_full_results",
     "llama": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
     "qwen_base": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
+    "llama_sem": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
+    "qwen_base_sem": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
 }
 
 DEFAULT_VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
@@ -166,7 +168,14 @@ class LlamaGuardClient:
         raise RuntimeError(f"Llama Guard request failed after retries: {last_err}")
 
 
-def _resolve_stage_dir(run_root: Path, method: str, model_short: str, seed: int, checkpoint: str) -> Path:
+def _resolve_stage_dir(
+    run_root: Path,
+    method: str,
+    model_short: str,
+    seed: int,
+    checkpoint: str,
+    order_name: str | None = None,
+) -> Path:
     cp = Path(checkpoint)
     if cp.exists():
         return cp
@@ -177,6 +186,32 @@ def _resolve_stage_dir(run_root: Path, method: str, model_short: str, seed: int,
         remapped = run_root / "artifacts" / method / model_short / f"seed_{seed}" / cp.parent.name / cp.name
         if remapped.exists():
             return remapped
+        if order_name:
+            remapped_order = (
+                run_root
+                / "artifacts"
+                / method
+                / model_short
+                / f"seed_{seed}"
+                / order_name
+                / cp.parent.name
+                / cp.name
+            )
+            if remapped_order.exists():
+                return remapped_order
+        if cp.parent.parent.name.startswith("order_"):
+            remapped_order = (
+                run_root
+                / "artifacts"
+                / method
+                / model_short
+                / f"seed_{seed}"
+                / cp.parent.parent.name
+                / cp.parent.name
+                / cp.name
+            )
+            if remapped_order.exists():
+                return remapped_order
 
     # Last fallback to original path even if missing (caller handles existence).
     return cp
@@ -194,8 +229,17 @@ def _copy_non_safety_files(src_stage_dir: Path, dst_stage_dir: Path) -> None:
             shutil.copy2(p, dst_stage_dir / p.name)
 
 
-def _seed_target_results_path(run_root: Path, method: str, model_short: str, seed: int) -> Path:
-    return run_root / "lg_artifacts" / "results" / method / model_short / f"seed_{seed}.json"
+def _seed_target_results_path(
+    run_root: Path,
+    method: str,
+    model_short: str,
+    seed: int,
+    order_name: str | None = None,
+) -> Path:
+    root = run_root / "lg_artifacts" / "results" / method / model_short
+    if order_name:
+        return root / f"seed_{seed}" / f"{order_name}.json"
+    return root / f"seed_{seed}.json"
 
 
 def _artifact_target_stage_dir(
@@ -205,8 +249,12 @@ def _artifact_target_stage_dir(
     seed: int,
     adapter_dir: str,
     stage_dir_name: str,
+    order_name: str | None = None,
 ) -> Path:
-    return run_root / "lg_artifacts" / "artifacts" / method / model_short / f"seed_{seed}" / adapter_dir / stage_dir_name
+    root = run_root / "lg_artifacts" / "artifacts" / method / model_short / f"seed_{seed}"
+    if order_name:
+        root = root / order_name
+    return root / adapter_dir / stage_dir_name
 
 
 def _process_seed_results(
@@ -218,9 +266,21 @@ def _process_seed_results(
 ) -> dict[str, Any]:
     data = _read_json(src_seed_json)
 
-    method = src_seed_json.parent.parent.name
-    model_short = src_seed_json.parent.name
-    seed = int(data.get("seed", int(src_seed_json.stem.split("_")[-1])))
+    rel = src_seed_json.relative_to(run_root / "results")
+    if len(rel.parts) == 3:
+        method, model_short, seed_file = rel.parts
+        order_name = None
+        if not seed_file.startswith("seed_"):
+            raise ValueError(f"Unexpected seed result file: {src_seed_json}")
+        seed = int(data.get("seed", int(Path(seed_file).stem.split("_")[-1])))
+    elif len(rel.parts) == 4:
+        method, model_short, seed_dir_name, order_file = rel.parts
+        order_name = Path(order_file).stem
+        if not seed_dir_name.startswith("seed_"):
+            raise ValueError(f"Unexpected SEM seed directory: {src_seed_json}")
+        seed = int(data.get("seed", int(seed_dir_name.split("_")[-1])))
+    else:
+        raise ValueError(f"Unsupported results path layout: {src_seed_json}")
 
     updated_data = json.loads(json.dumps(data))
 
@@ -229,7 +289,7 @@ def _process_seed_results(
 
     for stage in updated_data.get("stages", []):
         cp_raw = str(stage.get("checkpoint", ""))
-        src_stage_dir = _resolve_stage_dir(run_root, method, model_short, seed, cp_raw)
+        src_stage_dir = _resolve_stage_dir(run_root, method, model_short, seed, cp_raw, order_name=order_name)
         src_safety_path = src_stage_dir / SAFETY_JSONL
         if not src_safety_path.exists():
             continue
@@ -285,6 +345,7 @@ def _process_seed_results(
             seed=seed,
             adapter_dir=adapter_dir,
             stage_dir_name=stage_dir_name,
+            order_name=order_name,
         )
 
         # Point LG result checkpoints at the LG artifact tree.
@@ -301,7 +362,7 @@ def _process_seed_results(
                 metrics["asr"] = float(stage_asr)
                 _write_json(metrics_path, metrics)
 
-    dst_seed_json = _seed_target_results_path(run_root, method, model_short, seed)
+    dst_seed_json = _seed_target_results_path(run_root, method, model_short, seed, order_name=order_name)
     if not dry_run:
         _write_json(dst_seed_json, updated_data)
 
@@ -317,7 +378,10 @@ def _process_seed_results(
 
 
 def _iter_seed_jsons(run_root: Path) -> list[Path]:
-    return sorted((run_root / "results").glob("*/*/seed_*.json"))
+    results_root = run_root / "results"
+    flat = results_root.glob("*/*/seed_*.json")
+    nested = results_root.glob("*/*/seed_*/*.json")
+    return sorted(set(flat).union(nested))
 
 
 def main() -> None:

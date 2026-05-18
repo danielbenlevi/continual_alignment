@@ -12,6 +12,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+DEFAULT_BASE_MODEL_ALIGN_N = 1500
+DEFAULT_WILDJAILBREAK_ALIGN_N = 10000
+COLLABORATOR_BATCH_SIZE = 20
+COLLABORATOR_LR = 5e-5
+COLLABORATOR_LORA_ALPHA = 4
+COLLABORATOR_LORA_DROPOUT = 0.1
+COLLABORATOR_COSINE_WARMUP_RATIO = 0.1
+
 
 @dataclass
 class ExperimentSpec:
@@ -28,6 +36,8 @@ class JobSpec:
     base_model: str
     model_alias: str
     seed: int
+    ordering_id: str
+    task_order: List[str]
     output_path: Path
     results_json: Path
     fire_args: Dict[str, Any]
@@ -70,6 +80,7 @@ def _is_base_model_name(model_name: str) -> bool:
         or leaf.endswith("_base")
         or ("-base-" in leaf)
         or ("_base_" in leaf)
+        or leaf in {"llama-2-7b", "llama-2-7b-hf"}
     )
 
 
@@ -97,6 +108,25 @@ def _parse_gpus(raw: str) -> List[str]:
     if len(gpus) > 8:
         raise ValueError("At most 8 GPUs are supported by this orchestrator.")
     return gpus
+
+
+def _parse_task_orderings(raw: str) -> List[List[str]]:
+    orderings: List[List[str]] = []
+    for part in str(raw).split(";"):
+        p = part.strip()
+        if not p:
+            continue
+        tasks = [x.strip().lower() for x in p.split(",") if x.strip()]
+        if not tasks:
+            continue
+        if len(tasks) != len(set(tasks)):
+            raise ValueError(f"Task ordering has duplicates: {tasks}")
+        if tasks[0] != "safety":
+            raise ValueError("Each task ordering must start with 'safety'.")
+        orderings.append(tasks)
+    if not orderings:
+        raise ValueError("Expected at least one task ordering.")
+    return orderings
 
 
 def _fire_arg(key: str, value: Any) -> str:
@@ -137,41 +167,99 @@ def _build_jobs(
     experiments: Sequence[ExperimentSpec],
     models: Sequence[str],
     seeds: Sequence[int],
+    task_orderings: Sequence[Sequence[str]],
+    batch_size: int,
+    eval_batch_size: int,
+    base_model_align_n: int,
+    use_llama2_plain_text_template: bool,
+    short_safety_t1: bool,
+    use_wildjailbreak_alignment: bool,
+    wildjailbreak_align_n: int,
+    use_collaborator_hparams: bool,
     run_root: Path,
 ) -> List[JobSpec]:
     jobs: List[JobSpec] = []
     for model in models:
         alias = _model_alias(model)
+        world_size = _world_size_for_model(model)
+        if world_size <= 0:
+            raise ValueError(f"Invalid world_size={world_size} for model={model}")
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be > 0")
+        if int(eval_batch_size) <= 0:
+            raise ValueError("eval_batch_size must be > 0")
+        if (not use_collaborator_hparams) and (int(batch_size) % int(world_size) != 0):
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by world_size ({world_size}) for model={model}."
+            )
+        if int(eval_batch_size) % int(world_size) != 0:
+            raise ValueError(
+                f"eval_batch_size ({eval_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
+            )
+        effective_batch_size = int(COLLABORATOR_BATCH_SIZE) if use_collaborator_hparams else int(batch_size)
+        if effective_batch_size % int(world_size) != 0:
+            raise ValueError(
+                f"effective batch_size ({effective_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
+            )
+        micro_batch_size = int(effective_batch_size) // int(world_size)
         for seed in seeds:
-            for exp in experiments:
-                seed_tag = f"seed_{seed}"
-                job_id = f"{exp.key}__{alias}__{seed_tag}"
-                output_path = run_root / "artifacts" / exp.key / alias / seed_tag
-                results_json = run_root / "results" / exp.key / alias / f"{seed_tag}.json"
-
-                fire_args: Dict[str, Any] = {
-                    "base_model": model,
-                    "seed": int(seed),
-                    "chat_template_mode": "never" if _is_base_model_name(model) else "auto",
-                    "output_path": str(output_path),
-                    "results_json": str(results_json),
-                    "wandb_run_name": job_id,
-                }
-                fire_args.update(exp.fire_args)
-
-                jobs.append(
-                    JobSpec(
-                        job_id=job_id,
-                        experiment_key=exp.key,
-                        script_path=exp.script_path,
-                        base_model=model,
-                        model_alias=alias,
-                        seed=int(seed),
-                        output_path=output_path,
-                        results_json=results_json,
-                        fire_args=fire_args,
+            for ordering_idx, task_order in enumerate(task_orderings):
+                ordering_tag = f"order_{ordering_idx}"
+                perf_order = list(task_order[1:])
+                perf_csv = ",".join(perf_order)
+                for exp in experiments:
+                    seed_tag = f"seed_{seed}"
+                    job_id = f"{exp.key}__{alias}__{seed_tag}__{ordering_tag}"
+                    output_path = run_root / "artifacts" / exp.key / alias / seed_tag / ordering_tag
+                    results_json = (
+                        run_root / "results" / exp.key / alias / seed_tag / f"{ordering_tag}.json"
                     )
-                )
+                    fire_args: Dict[str, Any] = {
+                        "base_model": model,
+                        "seed": int(seed),
+                        "chat_template_mode": "never" if _is_base_model_name(model) else "auto",
+                        "performance_tasks": perf_csv,
+                        "batch_size": int(effective_batch_size),
+                        "micro_batch_size": int(micro_batch_size),
+                        "eval_batch_size": int(eval_batch_size),
+                        "output_path": str(output_path),
+                        "results_json": str(results_json),
+                        "wandb_run_name": job_id,
+                    }
+                    if use_llama2_plain_text_template:
+                        fire_args["use_llama2_plain_text_template"] = True
+                    if _is_base_model_name(model):
+                        align_n_value = int(base_model_align_n)
+                        if use_wildjailbreak_alignment:
+                            align_n_value = int(wildjailbreak_align_n)
+                        fire_args["align_n"] = int(align_n_value)
+                    if use_wildjailbreak_alignment:
+                        fire_args["alignment_source"] = "wildjailbreak_chat"
+                    if short_safety_t1:
+                        fire_args["first_task_epochs"] = 3
+                    if use_collaborator_hparams:
+                        fire_args["learning_rate"] = float(COLLABORATOR_LR)
+                        fire_args["lora_alpha"] = int(COLLABORATOR_LORA_ALPHA)
+                        fire_args["lora_dropout"] = float(COLLABORATOR_LORA_DROPOUT)
+                        fire_args["use_explicit_cosine_warmup"] = True
+                        fire_args["cosine_warmup_ratio"] = float(COLLABORATOR_COSINE_WARMUP_RATIO)
+                    fire_args.update(exp.fire_args)
+
+                    jobs.append(
+                        JobSpec(
+                            job_id=job_id,
+                            experiment_key=exp.key,
+                            script_path=exp.script_path,
+                            base_model=model,
+                            model_alias=alias,
+                            seed=int(seed),
+                            ordering_id=ordering_tag,
+                            task_order=list(task_order),
+                            output_path=output_path,
+                            results_json=results_json,
+                            fire_args=fire_args,
+                        )
+                    )
     return jobs
 
 
@@ -197,7 +285,11 @@ def _prepare_env(gpu_id: str, master_port: int) -> Dict[str, str]:
 
 def _world_size_for_model(base_model: str) -> int:
     model_name = str(base_model).lower()
+    if ("llama-2-7b" in model_name) and _is_base_model_name(base_model):
+        return 4
     if "llama" in model_name:
+        return 2
+    if "qwen3-4b-base" in model_name:
         return 2
     return 1
 
@@ -280,6 +372,8 @@ def _launch_job(
             "base_model": job.base_model,
             "model_alias": job.model_alias,
             "seed": int(job.seed),
+            "ordering_id": job.ordering_id,
+            "task_order": job.task_order,
             "output_path": str(job.output_path),
             "results_json": str(job.results_json),
             "gpu_ids": [str(g) for g in gpu_ids],
@@ -319,6 +413,13 @@ def _resolve_python(python_value: str) -> str:
 def _job_from_manifest_entry(entry: Dict[str, Any]) -> JobSpec:
     base_model = str(entry["base_model"])
     seed = int(entry["seed"])
+    fire_args = dict(entry.get("fire_args", {}))
+    ordering_id = str(entry.get("ordering_id", "order_0"))
+    task_order = entry.get("task_order")
+    if not isinstance(task_order, list) or not task_order:
+        perf_csv = str(fire_args.get("performance_tasks", "gsm8k,sst2,mbpp,xsum,sciq,multiwoz"))
+        perf_order = [x.strip().lower() for x in perf_csv.split(",") if x.strip()]
+        task_order = ["safety"] + perf_order
     return JobSpec(
         job_id=str(entry["job_id"]),
         experiment_key=str(entry["experiment_key"]),
@@ -326,9 +427,11 @@ def _job_from_manifest_entry(entry: Dict[str, Any]) -> JobSpec:
         base_model=base_model,
         model_alias=_model_alias(base_model),
         seed=seed,
+        ordering_id=ordering_id,
+        task_order=list(task_order),
         output_path=Path(str(entry["output_path"])),
         results_json=Path(str(entry["results_json"])),
-        fire_args=dict(entry["fire_args"]),
+        fire_args=fire_args,
     )
 
 
@@ -406,9 +509,88 @@ def main() -> int:
         default="Qwen/Qwen3-0.6B",
         help="Comma-separated base model names.",
     )
-    parser.add_argument("--seeds", type=str, default="42,0,1,2,3,4", help="Comma-separated integer seeds.")
+    parser.add_argument("--seeds", type=str, default="0,1,2,3", help="Comma-separated integer seeds.")
+    parser.add_argument(
+        "--task-orderings",
+        type=str,
+        default=(
+            "safety,gsm8k,sst2,mbpp,xsum,sciq,multiwoz;"
+            "safety,mbpp,xsum,sst2,sciq,multiwoz,gsm8k;"
+            "safety,sciq,gsm8k,multiwoz,xsum,mbpp,sst2"
+        ),
+        help=(
+            "Semicolon-separated task orderings. "
+            "Each ordering is comma-separated and must start with safety."
+        ),
+    )
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=8,
+        help="Global train batch size passed to all trainers.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=128,
+        help="Global eval generation batch size passed to all trainers.",
+    )
+    parser.add_argument(
+        "--base-model-align-n",
+        type=int,
+        default=DEFAULT_BASE_MODEL_ALIGN_N,
+        help="Alignment examples for base checkpoints (e.g., *-Base).",
+    )
+    parser.add_argument(
+        "--use-llama2-plain-text-template",
+        action="store_true",
+        help=(
+            "Pass --use_llama2_plain_text_template=True to trainer jobs. "
+            "Default behavior is unchanged (off except auto-enabled for llama-2-7b)."
+        ),
+    )
+    parser.add_argument(
+        "--short-safety-t1",
+        action="store_true",
+        help=(
+            "Set first_task_epochs=3 for all trainer jobs. Since task order must start with safety, "
+            "this makes only T1 safety train for 3 epochs while later tasks still use num_epochs."
+        ),
+    )
+    parser.add_argument(
+        "--use-wildjailbreak-alignment",
+        action="store_true",
+        help=(
+            "Use WildJailbreak chat-style alignment data for T1 safety "
+            "(sets alignment_source=wildjailbreak_chat). Default is off. "
+            "When enabled, base-model jobs use --wildjailbreak-align-n."
+        ),
+    )
+    parser.add_argument(
+        "--use-collaborator-hparams",
+        action="store_true",
+        help=(
+            "Use collaborator stage-1-like training profile for all jobs: "
+            "batch_size=20, learning_rate=5e-5, lora_alpha=4, lora_dropout=0.1, "
+            "and explicit cosine scheduler with 10%% warmup."
+        ),
+    )
+    parser.add_argument(
+        "--wildjailbreak-align-n",
+        type=int,
+        default=DEFAULT_WILDJAILBREAK_ALIGN_N,
+        help=(
+            "Alignment example count used when --use-wildjailbreak-alignment is enabled. "
+            "Default 10000 (5000 harmful + 5000 benign)."
+        ),
+    )
     parser.add_argument("--python", type=str, default="python", help="Python executable for child jobs.")
-    parser.add_argument("--runs-root", type=str, default="./orchestrator_runs", help="Output root folder.")
+    parser.add_argument(
+        "--runs-root",
+        type=str,
+        default="./our_scripts/orchestrator_runs",
+        help="Output root folder.",
+    )
     parser.add_argument("--run-name-prefix", type=str, default="full_suite", help="Run folder name prefix.")
     parser.add_argument("--poll-seconds", type=float, default=20.0, help="Polling interval in seconds.")
     parser.add_argument(
@@ -457,6 +639,8 @@ def main() -> int:
                         "experiment_key": job.experiment_key,
                         "base_model": job.base_model,
                         "seed": int(job.seed),
+                        "ordering_id": job.ordering_id,
+                        "task_order": job.task_order,
                         "gpu_id": None,
                         "pid": None,
                         "returncode": 0,
@@ -483,13 +667,28 @@ def main() -> int:
         gpus = _parse_gpus(args.gpus or "0")
         models = _parse_csv_strs(args.models)
         seeds = _parse_csv_ints(args.seeds)
+        task_orderings = _parse_task_orderings(args.task_orderings)
         experiments = _build_experiments(script_dir)
 
         ts = _now_tag()
         run_root = Path(args.runs_root).resolve() / f"{_sanitize_slug(args.run_name_prefix)}_{ts}"
         run_root.mkdir(parents=True, exist_ok=True)
 
-        jobs = _build_jobs(experiments=experiments, models=models, seeds=seeds, run_root=run_root)
+        jobs = _build_jobs(
+            experiments=experiments,
+            models=models,
+            seeds=seeds,
+            task_orderings=task_orderings,
+            batch_size=int(args.train_batch_size),
+            eval_batch_size=int(args.eval_batch_size),
+            base_model_align_n=int(args.base_model_align_n),
+            use_llama2_plain_text_template=bool(args.use_llama2_plain_text_template),
+            short_safety_t1=bool(args.short_safety_t1),
+            use_wildjailbreak_alignment=bool(args.use_wildjailbreak_alignment),
+            wildjailbreak_align_n=int(args.wildjailbreak_align_n),
+            use_collaborator_hparams=bool(args.use_collaborator_hparams),
+            run_root=run_root,
+        )
         manifest = {
             "timestamp": ts,
             "run_root": str(run_root),
@@ -497,6 +696,15 @@ def main() -> int:
             "gpus": gpus,
             "models": models,
             "seeds": seeds,
+            "task_orderings": task_orderings,
+            "train_batch_size": int(args.train_batch_size),
+            "eval_batch_size": int(args.eval_batch_size),
+            "base_model_align_n": int(args.base_model_align_n),
+            "use_llama2_plain_text_template": bool(args.use_llama2_plain_text_template),
+            "short_safety_t1": bool(args.short_safety_t1),
+            "use_wildjailbreak_alignment": bool(args.use_wildjailbreak_alignment),
+            "wildjailbreak_align_n": int(args.wildjailbreak_align_n),
+            "use_collaborator_hparams": bool(args.use_collaborator_hparams),
             "poll_seconds": float(args.poll_seconds),
             "num_experiments": len(experiments),
             "num_jobs": len(jobs),
@@ -515,6 +723,8 @@ def main() -> int:
                     "script_path": str(job.script_path),
                     "base_model": job.base_model,
                     "seed": int(job.seed),
+                    "ordering_id": job.ordering_id,
+                    "task_order": job.task_order,
                     "output_path": str(job.output_path),
                     "results_json": str(job.results_json),
                     "fire_args": job.fire_args,
@@ -623,6 +833,8 @@ def main() -> int:
                     "experiment_key": job.experiment_key,
                     "base_model": job.base_model,
                     "seed": int(job.seed),
+                    "ordering_id": job.ordering_id,
+                    "task_order": job.task_order,
                     "gpu_ids": [str(g) for g in info.get("gpu_ids", [])],
                     "world_size": int(info.get("world_size", 1)),
                     "pid": int(info["pid"]),

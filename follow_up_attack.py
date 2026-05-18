@@ -210,6 +210,23 @@ def iter_seed_jsons(run_root: Path, model_short: str) -> list[Path]:
 
 def resolve_stage_dir(run_root: Path, method: str, model_short: str, seed: int, checkpoint: str, lg: bool) -> Path:
     cp = Path(checkpoint)
+
+    # When checkpoints come from LG results, they may point into lg_artifacts.
+    # For model loading we need the original adapter directory in artifacts/.
+    cp_s = str(cp)
+    lg_marker = "/lg_artifacts/artifacts/"
+    std_marker = "/artifacts/"
+    if lg:
+        if std_marker in cp_s and lg_marker not in cp_s:
+            lg_candidate = Path(cp_s.replace(std_marker, lg_marker, 1))
+            if lg_candidate.exists():
+                return lg_candidate
+    else:
+        if lg_marker in cp_s:
+            std_candidate = Path(cp_s.replace(lg_marker, std_marker, 1))
+            if std_candidate.exists():
+                return std_candidate
+
     if cp.exists():
         return cp
 
@@ -267,6 +284,15 @@ def collect_candidates(
                 checkpoint=checkpoint,
                 lg=True,
             )
+            model_stage_dir = resolve_stage_dir(
+                run_root=run_root,
+                method=method,
+                model_short=model_short,
+                seed=seed,
+                checkpoint=checkpoint,
+                lg=False,
+            )
+
             safety_path = stage_dir / SAFETY_JSONL
             if not safety_path.exists():
                 continue
@@ -299,7 +325,7 @@ def collect_candidates(
                     method=method,
                     seed=seed,
                     base_model=base_model,
-                    checkpoint=str(stage_dir),
+                    checkpoint=str(model_stage_dir),
                     row_idx=row_idx,
                     prompt=prompt,
                     original_response=response,

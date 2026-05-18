@@ -12,12 +12,16 @@ MODEL_CONFIG = {
         "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_updated.md",
         "qwen_base_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
         "qwen_base_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_updated.md",
+        "qwen_base_sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
+        "qwen_base_sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_sem.md",
     },
     "llama": {
         "short_model": "Llama-3.2-3B-Instruct",
         "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
         "mode_label": "llama",
         "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_updated.md",
+        "sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
+        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_sem.md",
     },
 }
 
@@ -46,10 +50,15 @@ def fmt_mean_std(values, include_std: bool = True):
     return f"{m:.2f}% ± {s:.2f}%"
 
 
-def infer_results_path(run_root: Path, method: str, base_model: str, seed: int, llama_guard: bool = False) -> Path:
+def infer_results_paths(run_root: Path, method: str, base_model: str, seed: int, llama_guard: bool = False) -> list[Path]:
     short_model = base_model.split("/")[-1]
     results_root = run_root / ("lg_artifacts/results" if llama_guard else "results")
-    return results_root / method / short_model / f"seed_{seed}.json"
+    flat = results_root / method / short_model / f"seed_{seed}.json"
+    nested_seed_dir = results_root / method / short_model / f"seed_{seed}"
+    candidates = [flat, nested_seed_dir / "order_0.json"]
+    if nested_seed_dir.exists():
+        candidates.extend(sorted(nested_seed_dir.glob("*.json")))
+    return candidates
 
 
 def load_by_method(run_root: Path, final_status_path: Path, llama_guard: bool = False):
@@ -59,9 +68,17 @@ def load_by_method(run_root: Path, final_status_path: Path, llama_guard: bool = 
         method = item["experiment_key"]
         base_model = item["base_model"]
         seed = int(item["seed"])
-        p = infer_results_path(run_root, method, base_model, seed, llama_guard=llama_guard)
-        if not llama_guard and not p.exists():
-            p = Path(item.get("results_json", ""))
+        p = None
+        for candidate in infer_results_paths(run_root, method, base_model, seed, llama_guard=llama_guard):
+            if candidate.exists():
+                p = candidate
+                break
+        if p is None and not llama_guard:
+            fallback = Path(item.get("results_json", ""))
+            if fallback.exists():
+                p = fallback
+        if p is None:
+            continue
         if not p.exists():
             continue
         data = json.loads(p.read_text())
@@ -160,6 +177,11 @@ def main():
         action="store_true",
         help="Use qwen-base defaults (qwen_base_updated_full_results + results_qwen_base_updated.md).",
     )
+    parser.add_argument(
+        "--sem",
+        action="store_true",
+        help="Use SEM run roots and SEM output defaults (llama_7b_sem_results or qwen_base_sem_results).",
+    )
     parser.add_argument("--llama-guard", action="store_true", help="Use lg_artifacts/results/* ASR annotations")
     args = parser.parse_args()
 
@@ -169,6 +191,15 @@ def main():
     if args.qwen_base and args.model_name == "qwen":
         default_run_root = model_cfg["qwen_base_default_run_root"]
         default_out = model_cfg["qwen_base_default_out"]
+    if args.sem:
+        if args.model_name == "llama":
+            default_run_root = model_cfg["sem_default_run_root"]
+            default_out = model_cfg["sem_default_out"]
+        elif args.model_name == "qwen":
+            if not args.qwen_base:
+                raise ValueError("For qwen SEM results, pass both --sem and --qwen-base.")
+            default_run_root = model_cfg["qwen_base_sem_default_run_root"]
+            default_out = model_cfg["qwen_base_sem_default_out"]
     run_root = Path(args.run_root or default_run_root).resolve()
     final_status = run_root / "final_status.json"
     if not final_status.exists():

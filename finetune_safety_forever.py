@@ -2,6 +2,7 @@ import os
 HF_CACHE_DIR = os.environ.get("HF_HOME", "/home/db3651/.cache/huggingface")
 os.environ["HF_HOME"] = HF_CACHE_DIR
 os.makedirs(HF_CACHE_DIR, exist_ok=True)
+LLAMA2_7B_LOCAL_MODEL_PATH = "/local/arise/db3651/continual_align/our_scripts/models/Llama-2-7b"
 
 import gc
 import json
@@ -103,7 +104,35 @@ def _is_base_model_name(base_model: str) -> bool:
         or model_leaf.endswith("_base")
         or ("-base-" in model_leaf)
         or ("_base_" in model_leaf)
+        or model_leaf in {"llama-2-7b", "llama-2-7b-hf"}
     )
+
+
+def _is_llama2_7b_target_model(base_model: str) -> bool:
+    model_name = str(base_model).strip().lower()
+    if "llama-2-7b" not in model_name:
+        return False
+    if ("chat" in model_name) or ("instruct" in model_name):
+        return False
+    return True
+
+
+def _resolve_model_source_for_loading(base_model: str) -> str:
+    if not _is_llama2_7b_target_model(base_model):
+        return str(base_model)
+    local_path = Path(LLAMA2_7B_LOCAL_MODEL_PATH)
+    if not local_path.exists():
+        raise FileNotFoundError(
+            f"Requested llama-2-7b model, but local checkpoint is missing at: {local_path}"
+        )
+    return str(local_path)
+
+
+def _resolve_llama2_plain_text_template(
+    base_model: str,
+    use_llama2_plain_text_template: bool,
+) -> bool:
+    return bool(use_llama2_plain_text_template or _is_llama2_7b_target_model(base_model))
 
 
 def _should_use_chat_template(base_model: str, chat_template_mode: str) -> bool:
@@ -126,6 +155,78 @@ def _prepare_tokenizer_and_model(tokenizer, model) -> None:
             tokenizer.pad_token = tokenizer.unk_token
     if getattr(model.config, "pad_token_id", None) is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
+
+
+def _resolve_alignment_examples(base_model: str, align_n: int) -> int:
+    return int(align_n)
+
+
+def _resolve_effective_micro_batch_size(
+    runtime: DDPRuntime,
+    batch_size: int,
+    micro_batch_size: int,
+) -> int:
+    global_batch = int(batch_size)
+    if global_batch <= 0:
+        raise ValueError("batch_size must be > 0")
+    if runtime.is_ddp:
+        ws = int(runtime.world_size)
+        if global_batch % ws != 0:
+            raise ValueError(
+                f"batch_size ({global_batch}) must be divisible by WORLD_SIZE ({ws}) in DDP mode."
+            )
+        expected = global_batch // ws
+    else:
+        expected = global_batch
+    passed = int(micro_batch_size)
+    if passed != expected:
+        print(
+            f"[batching] overriding micro_batch_size={passed} -> {expected} "
+            f"(batch_size={global_batch}, world_size={runtime.world_size})"
+        )
+    return expected
+
+
+def _validate_eval_batch_size(runtime: DDPRuntime, eval_batch_size: int) -> int:
+    global_eval = int(eval_batch_size)
+    if global_eval <= 0:
+        raise ValueError("eval_batch_size must be > 0")
+    if runtime.is_ddp and (global_eval % int(runtime.world_size)) != 0:
+        raise ValueError(
+            f"eval_batch_size ({global_eval}) must be divisible by WORLD_SIZE ({runtime.world_size}) in DDP mode."
+        )
+    return global_eval
+
+
+def _schedule_kwargs(
+    *,
+    use_explicit_cosine_warmup: bool,
+    cosine_warmup_ratio: float,
+    default_warmup_steps: int,
+) -> Dict[str, object]:
+    if not use_explicit_cosine_warmup:
+        return {"warmup_steps": int(default_warmup_steps)}
+    return {
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": float(cosine_warmup_ratio),
+        "warmup_steps": 0,
+    }
+
+
+def _parse_performance_tasks_arg(performance_tasks: object) -> List[str]:
+    if isinstance(performance_tasks, str):
+        parts = [performance_tasks]
+    elif isinstance(performance_tasks, (list, tuple)):
+        parts = [str(x) for x in performance_tasks]
+    else:
+        parts = [str(performance_tasks)]
+    tasks: List[str] = []
+    for part in parts:
+        for token in str(part).split(","):
+            t = token.strip().lower()
+            if t:
+                tasks.append(t)
+    return tasks
 
 
 class DriftRecorderCallback(transformers.TrainerCallback):
@@ -424,6 +525,8 @@ REFUSAL_PREFIX_RE = re.compile(
 _NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _ASSISTANT_PREFIX_RE = re.compile(r"^\s*assistant\s*:?\s*", re.IGNORECASE)
+_HUMAN_PREFIX_RE = re.compile(r"^\s*human\s*:\s*", re.IGNORECASE)
+_ASSISTANT_DELIM_RE = re.compile(r"(?:^|\n)\s*assistant\s*:\s*", re.IGNORECASE)
 _ALPACA_INSTR_RE = re.compile(r"^\s*#{3,6}\s*Instruction\s*:\s*", re.IGNORECASE)
 _ALPACA_INPUT_RE = re.compile(r"^\s*#{3,6}\s*Input\s*:\s*", re.IGNORECASE | re.MULTILINE)
 _ALPACA_RESP_RE = re.compile(r"\s*#{3,6}\s*Response\s*:\s*", re.IGNORECASE)
@@ -440,11 +543,36 @@ TASK_REGISTRY = {
 GENERATION_TASKS = {"xsum", "multiwoz"}
 
 
-def _format_eval_prompt(tokenizer, prompt: str, use_chat_template: bool = False) -> str:
+def _strip_human_assistant_scaffold(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return s
+    if _ALPACA_RESP_RE.search(s):
+        s = _strip_alpaca_scaffold(s)
+    s = _HUMAN_PREFIX_RE.sub("", s).strip()
+    parts = _ASSISTANT_DELIM_RE.split(s, maxsplit=1)
+    if parts:
+        s = parts[0].strip()
+    return s
+
+
+def _format_human_assistant_prefill(prompt: str) -> str:
+    user_text = _strip_human_assistant_scaffold(_strip_alpaca_scaffold(str(prompt)))
+    return f"Human: {user_text}\nAssistant: "
+
+
+def _format_eval_prompt(
+    tokenizer,
+    prompt: str,
+    use_chat_template: bool = False,
+    use_human_assistant_template: bool = False,
+) -> str:
     if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
         user_text = _strip_alpaca_scaffold(str(prompt))
         messages = [{"role": "user", "content": user_text}]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if use_human_assistant_template:
+        return _format_human_assistant_prefill(str(prompt))
     p = str(prompt).strip()
     if _ALPACA_RESP_RE.search(p):
         return p
@@ -472,6 +600,9 @@ def _clean_response_text(text: str) -> str:
     if _ALPACA_RESP_RE.search(s):
         parts = [p.strip() for p in _ALPACA_RESP_RE.split(s) if p.strip()]
         s = parts[-1] if parts else ""
+    assistant_parts = [p.strip() for p in _ASSISTANT_DELIM_RE.split(s) if p.strip()]
+    if assistant_parts:
+        s = assistant_parts[-1]
     for marker in (
         "<|assistant|>",
         "<|im_start|>assistant",
@@ -546,6 +677,7 @@ def _evaluate_safety_batched(
     batch_size: int,
     max_new_tokens: int = 100,
     use_chat_template: bool = False,
+    use_human_assistant_template: bool = False,
     return_records: bool = False,
     indexed_prompts: Optional[Sequence[Tuple[int, str]]] = None,
 ):
@@ -557,7 +689,15 @@ def _evaluate_safety_batched(
         if indexed_prompts is not None
         else [(idx, p) for idx, p in enumerate(harmful_prompts)]
     )
-    prompts = [_format_eval_prompt(tokenizer, p, use_chat_template=use_chat_template) for _, p in prompt_items]
+    prompts = [
+        _format_eval_prompt(
+            tokenizer,
+            p,
+            use_chat_template=use_chat_template,
+            use_human_assistant_template=use_human_assistant_template,
+        )
+        for _, p in prompt_items
+    ]
     old_padding_side = getattr(tokenizer, "padding_side", "right")
     tokenizer.padding_side = "left"
     try:
@@ -640,6 +780,7 @@ def _evaluate_task_performance_batched(
     batch_size: int,
     max_new_tokens: int = 64,
     use_chat_template: bool = False,
+    use_human_assistant_template: bool = False,
     return_records: bool = False,
     indexed_rows: Optional[Sequence[Tuple[int, Dict]]] = None,
 ):
@@ -664,7 +805,13 @@ def _evaluate_task_performance_batched(
             prompts = [ex["input"] for ex in chunk]
             gts = [ex["output"] for ex in chunk]
             model_prompts = [
-                _format_eval_prompt(tokenizer, p, use_chat_template=use_chat_template) for p in prompts
+                _format_eval_prompt(
+                    tokenizer,
+                    p,
+                    use_chat_template=use_chat_template,
+                    use_human_assistant_template=use_human_assistant_template,
+                )
+                for p in prompts
             ]
 
             toks = tokenizer(model_prompts, return_tensors="pt", padding=True).to(device)
@@ -732,6 +879,7 @@ def _evaluate_generation_task_batched(
     batch_size: int,
     max_new_tokens: int = 64,
     use_chat_template: bool = False,
+    use_human_assistant_template: bool = False,
     return_records: bool = False,
     indexed_rows: Optional[Sequence[Tuple[int, Dict]]] = None,
 ):
@@ -754,7 +902,13 @@ def _evaluate_generation_task_batched(
             prompts = [ex["input"] for ex in chunk]
             refs = [ex["output"] for ex in chunk]
             model_prompts = [
-                _format_eval_prompt(tokenizer, p, use_chat_template=use_chat_template) for p in prompts
+                _format_eval_prompt(
+                    tokenizer,
+                    p,
+                    use_chat_template=use_chat_template,
+                    use_human_assistant_template=use_human_assistant_template,
+                )
+                for p in prompts
             ]
 
             toks = tokenizer(
@@ -948,12 +1102,21 @@ def _build_prompt_pair(data_point: dict) -> Tuple[str, str]:
     return user_prompt, full_prompt
 
 
+def _build_human_assistant_prompt_pair(data_point: dict) -> Tuple[str, str]:
+    user_text = _strip_human_assistant_scaffold(_chat_user_text_from_point(data_point))
+    user_prompt = f"Human: {user_text}\nAssistant: "
+    out = str(data_point.get("output", ""))
+    full_prompt = f"{user_prompt}{out}"
+    return user_prompt, full_prompt
+
+
 def _tokenize_example_builder(
     tokenizer,
     max_input_length: int,
     train_on_inputs: bool,
     add_eos_token: bool,
     use_chat_template: bool,
+    use_human_assistant_template: bool,
 ):
     def tokenize(prompt, add_eos: bool = True):
         result = tokenizer(
@@ -1024,7 +1187,10 @@ def _tokenize_example_builder(
                 "labels": labels,
             }
 
-        user_prompt, full_prompt = _build_prompt_pair(data_point)
+        if use_human_assistant_template:
+            user_prompt, full_prompt = _build_human_assistant_prompt_pair(data_point)
+        else:
+            user_prompt, full_prompt = _build_prompt_pair(data_point)
         tokenized_full_prompt = tokenize(full_prompt, add_eos=add_eos_token)
         if not train_on_inputs:
             tokenized_user_prompt = tokenize(user_prompt, add_eos=add_eos_token)
@@ -1043,6 +1209,7 @@ def _run_task_training(
     *,
     runtime: DDPRuntime,
     base_model: str,
+    model_source: str,
     task_id: int,
     task_name: str,
     task_order: Sequence[str],
@@ -1066,6 +1233,7 @@ def _run_task_training(
     lora_target_modules: Sequence[str],
     train_on_inputs: bool,
     add_eos_token: bool,
+    use_human_assistant_template: bool,
     seed: int,
     chat_template_mode: str,
     wandb_project: str,
@@ -1081,6 +1249,8 @@ def _run_task_training(
     safety_token_weight: float,
     safety_token_count: int,
     safety_token_warmup_frac: float,
+    use_explicit_cosine_warmup: bool,
+    cosine_warmup_ratio: float,
 ):
     if runtime.is_main_process:
         print(f"Training CLMM-FOREVER Task-{task_id}: {task_name}")
@@ -1136,15 +1306,19 @@ def _run_task_training(
         device_map = {"": int(runtime.local_rank)}
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model,
+        model_source,
         dtype=torch.float16,
         device_map=device_map,
     )
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(model_source)
     tokenizer.padding_side = "left"
     _prepare_tokenizer_and_model(tokenizer, model)
     use_chat_template = _should_use_chat_template(base_model, chat_template_mode)
-    print(f"[prompting] use_chat_template={use_chat_template} (mode={chat_template_mode})")
+    print(
+        f"[prompting] use_chat_template={use_chat_template} "
+        f"use_human_assistant_template={use_human_assistant_template} "
+        f"(mode={chat_template_mode})"
+    )
 
     generate_and_tokenize_prompt = _tokenize_example_builder(
         tokenizer=tokenizer,
@@ -1152,6 +1326,7 @@ def _run_task_training(
         train_on_inputs=train_on_inputs,
         add_eos_token=add_eos_token,
         use_chat_template=use_chat_template,
+        use_human_assistant_template=use_human_assistant_template,
     )
 
     current_data = train_dataset_raw.shuffle(seed=seed + task_id).map(generate_and_tokenize_prompt)
@@ -1287,7 +1462,6 @@ def _run_task_training(
             calib_args = transformers.TrainingArguments(
                 per_device_train_batch_size=per_device_train_batch_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
-                warmup_steps=10,
                 max_steps=calib_steps,
                 learning_rate=learning_rate,
                 fp16=True,
@@ -1299,6 +1473,11 @@ def _run_task_training(
                 output_dir=output_dir,
                 report_to=report_to_target,
                 run_name=f"{wandb_run_name}_phase_{phase_idx}" if (len(wandb_run_name) > 0) else None,
+                **_schedule_kwargs(
+                    use_explicit_cosine_warmup=use_explicit_cosine_warmup,
+                    cosine_warmup_ratio=cosine_warmup_ratio,
+                    default_warmup_steps=10,
+                ),
             )
 
             trainer_calib = MyTrainer(
@@ -1426,7 +1605,6 @@ def _run_task_training(
             replay_args = transformers.TrainingArguments(
                 per_device_train_batch_size=per_device_train_batch_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
-                warmup_steps=5,
                 num_train_epochs=replay_epochs,
                 learning_rate=learning_rate,
                 fp16=True,
@@ -1435,6 +1613,11 @@ def _run_task_training(
                 save_strategy="no",
                 output_dir=output_dir,
                 report_to=report_to_target,
+                **_schedule_kwargs(
+                    use_explicit_cosine_warmup=use_explicit_cosine_warmup,
+                    cosine_warmup_ratio=cosine_warmup_ratio,
+                    default_warmup_steps=5,
+                ),
             )
 
             trainer_memory = ReplayTrainer(
@@ -1572,7 +1755,6 @@ def _run_task_training(
         current_args = transformers.TrainingArguments(
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=10,
             max_steps=remaining_steps,
             learning_rate=learning_rate,
             fp16=True,
@@ -1584,6 +1766,11 @@ def _run_task_training(
             output_dir=output_dir,
             report_to=report_to_target,
             run_name=f"{wandb_run_name}_phase_{phase_idx}" if (len(wandb_run_name) > 0) else None,
+            **_schedule_kwargs(
+                use_explicit_cosine_warmup=use_explicit_cosine_warmup,
+                cosine_warmup_ratio=cosine_warmup_ratio,
+                default_warmup_steps=10,
+            ),
         )
 
         callbacks = [drift_recorder]
@@ -1678,6 +1865,7 @@ def _eval_suite(
     device: torch.device,
     eval_batch_size: int,
     use_chat_template: bool,
+    use_human_assistant_template: bool,
     save_dir: str,
     runtime: DDPRuntime,
 ) -> Dict[str, float]:
@@ -1689,6 +1877,7 @@ def _eval_suite(
             device=device,
             batch_size=eval_batch_size,
             use_chat_template=use_chat_template,
+            use_human_assistant_template=use_human_assistant_template,
             return_records=True,
         )
         _write_jsonl(Path(save_dir) / "eval_generations_safety.jsonl", safety_records)
@@ -1703,6 +1892,7 @@ def _eval_suite(
                     batch_size=eval_batch_size,
                     max_new_tokens=64,
                     use_chat_template=use_chat_template,
+                    use_human_assistant_template=use_human_assistant_template,
                     return_records=True,
                 )
             else:
@@ -1715,6 +1905,7 @@ def _eval_suite(
                     device=device,
                     batch_size=eval_batch_size,
                     use_chat_template=use_chat_template,
+                    use_human_assistant_template=use_human_assistant_template,
                     return_records=True,
                     **kw,
                 )
@@ -1733,6 +1924,7 @@ def _eval_suite(
         device=device,
         batch_size=per_rank_batch,
         use_chat_template=use_chat_template,
+        use_human_assistant_template=use_human_assistant_template,
         return_records=True,
         indexed_prompts=local_safety,
     )
@@ -1756,6 +1948,7 @@ def _eval_suite(
                 batch_size=per_rank_batch,
                 max_new_tokens=64,
                 use_chat_template=use_chat_template,
+                use_human_assistant_template=use_human_assistant_template,
                 return_records=True,
                 indexed_rows=local_rows,
             )
@@ -1779,6 +1972,7 @@ def _eval_suite(
                 device=device,
                 batch_size=per_rank_batch,
                 use_chat_template=use_chat_template,
+                use_human_assistant_template=use_human_assistant_template,
                 return_records=True,
                 indexed_rows=local_rows,
                 **kw,
@@ -1814,9 +2008,12 @@ def train(
     lora_r: int = 8,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
+    use_explicit_cosine_warmup: bool = False,
+    cosine_warmup_ratio: float = 0.1,
     lora_target_modules: List[str] = ("q_proj", "v_proj"),
     train_on_inputs: bool = False,
     add_eos_token: bool = True,
+    use_llama2_plain_text_template: bool = False,
     seed: int = 42,
     chat_template_mode: str = "auto",
     wandb_project: str = "",
@@ -1864,13 +2061,38 @@ def train(
     runtime = get_ddp_runtime()
     setup_ddp_device(runtime)
     set_seed(int(seed))
+    model_source = _resolve_model_source_for_loading(base_model)
+    use_human_assistant_template = _resolve_llama2_plain_text_template(
+        base_model=base_model,
+        use_llama2_plain_text_template=use_llama2_plain_text_template,
+    )
     chat_template_mode = _normalize_chat_template_mode(chat_template_mode)
     use_chat_template = _should_use_chat_template(base_model, chat_template_mode)
+    align_n = _resolve_alignment_examples(base_model, align_n)
+    micro_batch_size = _resolve_effective_micro_batch_size(
+        runtime=runtime,
+        batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
+    )
+    eval_batch_size = _validate_eval_batch_size(runtime, eval_batch_size)
 
     cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
     os.makedirs(cache_dir, exist_ok=True)
     output_path = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(output_path, exist_ok=True)
+    if runtime.is_main_process:
+        if use_human_assistant_template and not use_llama2_plain_text_template:
+            print(
+                "[prompting] auto-enabled --use_llama2_plain_text_template for llama-2-7b base model."
+            )
+        if model_source != str(base_model):
+            print(f"[model] loading from local path: {model_source}")
+        per_rank_eval = int(eval_batch_size) // int(runtime.world_size)
+        print(
+            f"[batching] world_size={runtime.world_size} batch_size={batch_size} "
+            f"micro_batch_size={micro_batch_size} eval_batch_size_global={eval_batch_size} "
+            f"eval_batch_size_per_rank={per_rank_eval}"
+        )
     if enable_safety_token_reweight is not None:
         enable_safety_token_kl = bool(enable_safety_token_reweight)
         print("[flags] --enable_safety_token_reweight is deprecated; use --enable_safety_token_kl.")
@@ -1878,7 +2100,7 @@ def train(
         print("[flags] --regularize_at_standard implies --use_safety_reference_model.")
     use_safety_reference_model = bool(use_safety_reference_model or regularize_at_standard)
 
-    perf_order = [x.strip().lower() for x in performance_tasks.split(",") if x.strip()]
+    perf_order = _parse_performance_tasks_arg(performance_tasks)
     if not perf_order:
         raise ValueError("performance_tasks must contain at least one task.")
     if len(perf_order) != len(set(perf_order)):
@@ -1967,6 +2189,7 @@ def train(
         model, tokenizer, out_dir = _run_task_training(
             runtime=runtime,
             base_model=base_model,
+            model_source=model_source,
             task_id=task_id,
             task_name=task_name,
             task_order=task_order,
@@ -1990,6 +2213,7 @@ def train(
             lora_target_modules=lora_target_modules,
             train_on_inputs=train_on_inputs,
             add_eos_token=add_eos_token,
+            use_human_assistant_template=use_human_assistant_template,
             seed=seed,
             chat_template_mode=chat_template_mode,
             wandb_project=wandb_project,
@@ -2005,6 +2229,8 @@ def train(
             safety_token_weight=safety_token_weight,
             safety_token_count=safety_token_count,
             safety_token_warmup_frac=safety_token_warmup_frac,
+            use_explicit_cosine_warmup=use_explicit_cosine_warmup,
+            cosine_warmup_ratio=cosine_warmup_ratio,
         )
 
         row = _eval_suite(
@@ -2015,6 +2241,7 @@ def train(
             device=device,
             eval_batch_size=eval_batch_size,
             use_chat_template=use_chat_template,
+            use_human_assistant_template=use_human_assistant_template,
             save_dir=out_dir,
             runtime=runtime,
         )
@@ -2038,9 +2265,11 @@ def train(
     if results_json and runtime.is_main_process:
         payload = {
             "base_model": base_model,
+            "model_source": model_source,
             "seed": int(seed),
             "chat_template_mode": chat_template_mode,
             "use_chat_template": bool(use_chat_template),
+            "use_llama2_plain_text_template": bool(use_human_assistant_template),
             "task_order": task_order,
             "alignment_source": safety_source,
             "safety_memory_ratio": safety_memory_ratio,

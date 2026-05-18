@@ -14,12 +14,17 @@ MODEL_CONFIG = {
         "qwen_base_short_model": "Qwen3-0.6B-Base",
         "qwen_base_default_updated_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
         "qwen_base_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_traj.md",
+        "qwen_base_sem_default_updated_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
+        "qwen_base_sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_sem_traj.md",
     },
     "llama": {
         "short_model": "Llama-3.2-3B-Instruct",
+        "sem_short_model": "Llama-2-7b",
         "default_initial_root": None,
         "default_updated_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
         "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_traj.md",
+        "sem_default_updated_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
+        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_sem_traj.md",
     },
 }
 
@@ -36,7 +41,15 @@ UNSAFE_RE = re.compile(
 
 def infer_seed_json(run_root: Path, method: str, seed: int, model_short: str, llama_guard: bool = False) -> Path:
     results_root = run_root / ("lg_artifacts/results" if llama_guard else "results")
-    return results_root / method / model_short / f"seed_{seed}.json"
+    flat = results_root / method / model_short / f"seed_{seed}.json"
+    if flat.exists():
+        return flat
+    seed_dir = results_root / method / model_short / f"seed_{seed}"
+    order0 = seed_dir / "order_0.json"
+    if order0.exists():
+        return order0
+    nested = sorted(seed_dir.glob("*.json")) if seed_dir.exists() else []
+    return nested[0] if nested else flat
 
 
 def load_eval_jsonl(stage_dir: Path, task: str):
@@ -154,8 +167,12 @@ def collect_method_samples(
             stage_dirs.append(cp)
             continue
         # Fallback: remap stale checkpoint paths to this run's artifacts tree.
-        # expected tail: <adapter_dir>/<stage_name>
+        # expected tails:
+        #  - default runs: <adapter_dir>/<stage_name>
+        #  - sem runs: <order_dir>/<adapter_dir>/<stage_name>
         remapped = seed_artifacts_root / cp.parent.name / cp.name
+        if cp.parent.parent.name.startswith("order_"):
+            remapped = seed_artifacts_root / cp.parent.parent.name / cp.parent.name / cp.name
         stage_dirs.append(remapped)
 
     rows_by_stage = [load_eval_jsonl(sdir, SAFETY_TASK) for sdir in stage_dirs]
@@ -323,6 +340,11 @@ def main():
         action="store_true",
         help="Use qwen-base defaults (Qwen3-0.6B-Base + qwen_base_updated_full_results + results_qwen_base_traj.md).",
     )
+    parser.add_argument(
+        "--sem",
+        action="store_true",
+        help="Use SEM run roots and SEM output defaults (llama_7b_sem_results or qwen_base_sem_results).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n", type=int, default=5)
     parser.add_argument("--random-seed", type=int, default=2026)
@@ -338,6 +360,18 @@ def main():
         model_short = cfg["qwen_base_short_model"]
         default_updated_root = cfg["qwen_base_default_updated_root"]
         default_out = cfg["qwen_base_default_out"]
+    if args.sem:
+        default_initial_root = None
+        if args.model_name == "llama":
+            model_short = cfg["sem_short_model"]
+            default_updated_root = cfg["sem_default_updated_root"]
+            default_out = cfg["sem_default_out"]
+        elif args.model_name == "qwen":
+            if not args.qwen_base:
+                raise ValueError("For qwen SEM results, pass both --sem and --qwen-base.")
+            model_short = cfg["qwen_base_short_model"]
+            default_updated_root = cfg["qwen_base_sem_default_updated_root"]
+            default_out = cfg["qwen_base_sem_default_out"]
 
     initial_root = Path(args.initial_root).resolve() if args.initial_root else (Path(default_initial_root).resolve() if default_initial_root else None)
     updated_root = Path(args.updated_root).resolve() if args.updated_root else (Path(default_updated_root).resolve() if default_updated_root else None)

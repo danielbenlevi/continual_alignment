@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import random
 import urllib.request
 from pathlib import Path
@@ -517,7 +518,76 @@ AlignmentSource = Literal[
     "saferlhf_chosen_refusal",
     "saferlhf_chosen",
     "saferlhf_contrast_refusalish",
+    "wildjailbreak_chat",
 ]
+
+
+def load_wildjailbreak_chat_alignment(
+    *,
+    n_samples: int = 10000,
+    seed: int = 42,
+) -> Dataset:
+    """
+    WildJailbreak alignment set using the same source file/selection strategy as
+    safety_clora/scripts/run_stage1_llama2.py.
+
+    Important: we return raw prompt/completion text (no "Human/Assistant" or
+    Alpaca wrapping) so trainer formatting behavior remains unchanged.
+    """
+    if n_samples <= 0:
+        return Dataset.from_list([])
+
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+
+    # Optional explicit override for clusters with custom local mirrors.
+    local_override = os.environ.get("WILDJAILBREAK_TSV_PATH", "").strip()
+    if local_override:
+        tsv_path = local_override
+    else:
+        try:
+            # Fast path: use cache only when available.
+            tsv_path = hf_hub_download(
+                repo_id="allenai/wildjailbreak",
+                filename="train/train.tsv",
+                repo_type="dataset",
+                local_files_only=True,
+            )
+        except Exception:
+            # Fallback: allow network download when cache is missing.
+            tsv_path = hf_hub_download(
+                repo_id="allenai/wildjailbreak",
+                filename="train/train.tsv",
+                repo_type="dataset",
+                local_files_only=False,
+            )
+    df = pd.read_csv(tsv_path, sep="\t", dtype=str, keep_default_na=False)
+
+    harmful_df = df[df["data_type"] == "vanilla_harmful"].reset_index(drop=True)
+    benign_df = df[df["data_type"] == "vanilla_benign"].reset_index(drop=True)
+
+    # Match stage1 loader balancing: half harmful, half benign.
+    n_harmful = int(n_samples) // 2
+    n_benign = int(n_samples) - n_harmful
+
+    rng = random.Random(seed)
+    h_idx = list(range(len(harmful_df)))
+    b_idx = list(range(len(benign_df)))
+    rng.shuffle(h_idx)
+    rng.shuffle(b_idx)
+    harmful_df = harmful_df.iloc[h_idx[: min(n_harmful, len(harmful_df))]]
+    benign_df = benign_df.iloc[b_idx[: min(n_benign, len(benign_df))]]
+
+    rows = []
+    for df_part in (harmful_df, benign_df):
+        for _, row in df_part.iterrows():
+            prompt = str(row.get("vanilla", "") or "").strip()
+            completion = str(row.get("completion", "") or "").strip()
+            if not prompt or not completion:
+                continue
+            rows.append({"input": prompt, "output": completion})
+
+    return Dataset.from_list(rows).shuffle(seed=seed)
 
 
 def load_alignment_sft_dataset(
@@ -534,6 +604,8 @@ def load_alignment_sft_dataset(
         return load_saferlhf_chosen_refusals(n_samples=n_samples, split=split, require_explicit_refusal=False)
     if source == "saferlhf_contrast_refusalish":
         return load_saferlhf_contrast_refusalish(n_samples=n_samples, split=split)
+    if source == "wildjailbreak_chat":
+        return load_wildjailbreak_chat_alignment(n_samples=n_samples, seed=42)
     raise ValueError(f"Unknown alignment source: {source}")
 
 
