@@ -1,6 +1,8 @@
 # Toward Alignment Preservation in True Continual Learning Settings
 
-Run from repo root (add CLI flags as needed):
+**Note:** this repo is actively being developed. Code relevant to our COMS 6998 course project submission can be found at commit **dd5d008**.
+
+To run all included methods, run this command from repo root (add CLI flags as needed):
 
 ```bash
 python full_experiment_orchestrator.py

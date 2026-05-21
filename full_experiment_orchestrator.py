@@ -14,11 +14,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_BASE_MODEL_ALIGN_N = 1500
 DEFAULT_WILDJAILBREAK_ALIGN_N = 10000
-COLLABORATOR_BATCH_SIZE = 20
-COLLABORATOR_LR = 5e-5
-COLLABORATOR_LORA_ALPHA = 4
-COLLABORATOR_LORA_DROPOUT = 0.1
-COLLABORATOR_COSINE_WARMUP_RATIO = 0.1
+# Collaborator FOREVER launcher profile (see clmm-project/scripts/resubmit_daniels_llama2.sh):
+# - no explicit LR/dropout/scheduler overrides (trainer defaults are used)
+# - explicit batch/eval/lora alpha settings below
+COLLABORATOR_BATCH_SIZE = 8
+COLLABORATOR_EVAL_BATCH_SIZE = 16
+COLLABORATOR_LORA_ALPHA = 16
 
 
 @dataclass
@@ -192,9 +193,13 @@ def _build_jobs(
             raise ValueError(
                 f"batch_size ({batch_size}) must be divisible by world_size ({world_size}) for model={model}."
             )
-        if int(eval_batch_size) % int(world_size) != 0:
+        effective_eval_batch_size = (
+            int(COLLABORATOR_EVAL_BATCH_SIZE) if use_collaborator_hparams else int(eval_batch_size)
+        )
+        if effective_eval_batch_size % int(world_size) != 0:
             raise ValueError(
-                f"eval_batch_size ({eval_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
+                "effective eval_batch_size "
+                f"({effective_eval_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
             )
         effective_batch_size = int(COLLABORATOR_BATCH_SIZE) if use_collaborator_hparams else int(batch_size)
         if effective_batch_size % int(world_size) != 0:
@@ -221,7 +226,7 @@ def _build_jobs(
                         "performance_tasks": perf_csv,
                         "batch_size": int(effective_batch_size),
                         "micro_batch_size": int(micro_batch_size),
-                        "eval_batch_size": int(eval_batch_size),
+                        "eval_batch_size": int(effective_eval_batch_size),
                         "output_path": str(output_path),
                         "results_json": str(results_json),
                         "wandb_run_name": job_id,
@@ -238,11 +243,7 @@ def _build_jobs(
                     if short_safety_t1:
                         fire_args["first_task_epochs"] = 3
                     if use_collaborator_hparams:
-                        fire_args["learning_rate"] = float(COLLABORATOR_LR)
                         fire_args["lora_alpha"] = int(COLLABORATOR_LORA_ALPHA)
-                        fire_args["lora_dropout"] = float(COLLABORATOR_LORA_DROPOUT)
-                        fire_args["use_explicit_cosine_warmup"] = True
-                        fire_args["cosine_warmup_ratio"] = float(COLLABORATOR_COSINE_WARMUP_RATIO)
                     fire_args.update(exp.fire_args)
 
                     jobs.append(
@@ -570,9 +571,9 @@ def main() -> int:
         "--use-collaborator-hparams",
         action="store_true",
         help=(
-            "Use collaborator stage-1-like training profile for all jobs: "
-            "batch_size=20, learning_rate=5e-5, lora_alpha=4, lora_dropout=0.1, "
-            "and explicit cosine scheduler with 10%% warmup."
+            "Use collaborator FOREVER launcher profile for all jobs: "
+            "batch_size=8, eval_batch_size=16, lora_alpha=16, and default "
+            "trainer LR/dropout/scheduler settings."
         ),
     )
     parser.add_argument(

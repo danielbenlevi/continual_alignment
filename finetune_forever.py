@@ -435,7 +435,7 @@ def _strip_human_assistant_scaffold(text: str) -> str:
 
 def _format_human_assistant_prefill(prompt: str) -> str:
     user_text = _strip_human_assistant_scaffold(_strip_alpaca_scaffold(str(prompt)))
-    return f"Human: {user_text}\nAssistant: "
+    return f"Human: {user_text}\nAssistant:"
 
 
 def _format_eval_prompt(
@@ -951,7 +951,7 @@ def _build_prompt_pair(data_point: dict) -> Tuple[str, str]:
 
 def _build_human_assistant_prompt_pair(data_point: dict) -> Tuple[str, str]:
     user_text = _strip_human_assistant_scaffold(_chat_user_text_from_point(data_point))
-    user_prompt = f"Human: {user_text}\nAssistant: "
+    user_prompt = f"Human: {user_text}\nAssistant:"
     out = str(data_point.get("output", ""))
     full_prompt = f"{user_prompt}{out}"
     return user_prompt, full_prompt
@@ -1751,7 +1751,7 @@ def train(
     learning_rate: float = 3e-4,
     max_input_length: int = 512,
     lora_r: int = 8,
-    lora_alpha: int = 32,
+    lora_alpha: int = 16, # 32
     lora_dropout: float = 0.05,
     use_explicit_cosine_warmup: bool = False,
     cosine_warmup_ratio: float = 0.1,
