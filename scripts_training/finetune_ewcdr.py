@@ -3,12 +3,12 @@ EWC-DR: Elastic weight consolidation with diagonal regularization for LLM safety
 
 Port of continual_alignment/finetune_ewcdr.py with updated imports.
 Safety-EWC-DR defaults: safety_task1_upweight=True, safety_lamda_multiplier=0.5.
-Entry point: python our_scripts/scripts_training/finetune_ewcdr.py [args] (or via fire.Fire).
+Entry point: python scripts_training/finetune_ewcdr.py [args] (or via fire.Fire).
 """
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -30,15 +30,15 @@ from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import set_seed
 
-from our_scripts.scripts_utils.data_helpers import load_advbench_harmful
-from our_scripts.scripts_utils.ddp_runtime import (
+from scripts_utils.data_helpers import load_advbench_harmful
+from scripts_utils.ddp_runtime import (
     DDPRuntime,
     ddp_barrier,
     ddp_is_initialized,
     get_ddp_runtime,
     setup_ddp_device,
 )
-from our_scripts.scripts_training.finetune_forever import (
+from scripts_training.finetune_forever import (
     TASK_REGISTRY,
     _eval_suite,
     _fmt_eval_row,

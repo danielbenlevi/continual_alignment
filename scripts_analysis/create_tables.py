@@ -4,24 +4,26 @@ import json
 from pathlib import Path
 from statistics import mean, stdev
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 MODEL_CONFIG = {
     "qwen": {
         "short_model": "Qwen3-0.6B",
-        "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/updated_full_results",
+        "default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "updated_full_results"),
         "mode_label": "qwen",
-        "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_updated.md",
-        "qwen_base_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
-        "qwen_base_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_updated.md",
-        "qwen_base_sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
-        "qwen_base_sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_qwen_base_sem.md",
+        "default_out": str(PROJECT_ROOT / "results_summary" / "results_qwen_updated.md"),
+        "qwen_base_default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_updated_full_results"),
+        "qwen_base_default_out": str(PROJECT_ROOT / "results_summary" / "results_qwen_base_updated.md"),
+        "qwen_base_sem_default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_sem_results"),
+        "qwen_base_sem_default_out": str(PROJECT_ROOT / "results_summary" / "results_qwen_base_sem.md"),
     },
     "llama": {
         "short_model": "Llama-3.2-3B-Instruct",
-        "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
+        "default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "llama_updated_full_results"),
         "mode_label": "llama",
-        "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_updated.md",
-        "sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
-        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/results_llama_sem.md",
+        "default_out": str(PROJECT_ROOT / "results_summary" / "results_llama_updated.md"),
+        "sem_default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "llama_7b_sem_results"),
+        "sem_default_out": str(PROJECT_ROOT / "results_summary" / "results_llama_sem.md"),
     },
 }
 

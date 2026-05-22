@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument(
         "--models-dir",
         default=None,
-        help="Directory to store downloaded models (default: <our_scripts>/models)",
+        help="Directory to store downloaded models (default: <project-root>/models)",
     )
     parser.add_argument(
         "--local-name",

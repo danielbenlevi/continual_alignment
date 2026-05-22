@@ -14,12 +14,14 @@ from typing import Any
 
 import requests
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 RUN_ROOTS = {
-    "qwen": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/updated_full_results",
-    "llama": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
-    "qwen_base": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
-    "llama_sem": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
-    "qwen_base_sem": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
+    "qwen": str(PROJECT_ROOT / "orchestrator_runs" / "updated_full_results"),
+    "llama": str(PROJECT_ROOT / "orchestrator_runs" / "llama_updated_full_results"),
+    "qwen_base": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_updated_full_results"),
+    "llama_sem": str(PROJECT_ROOT / "orchestrator_runs" / "llama_7b_sem_results"),
+    "qwen_base_sem": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_sem_results"),
 }
 
 DEFAULT_VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")

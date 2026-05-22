@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -16,14 +16,14 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 
-from our_scripts.scripts_utils.trainer import Trainer, load_model_and_tokenizer
-from our_scripts.scripts_utils.data_helpers import load_advbench_harmful
-from our_scripts.scripts_utils.ddp_runtime import (
+from scripts_utils.trainer import Trainer, load_model_and_tokenizer
+from scripts_utils.data_helpers import load_advbench_harmful
+from scripts_utils.ddp_runtime import (
     ddp_barrier,
     get_ddp_runtime,
     setup_ddp_device,
 )
-from our_scripts.scripts_training.finetune_forever import (
+from scripts_training.finetune_forever import (
     TASK_REGISTRY,
     _eval_suite,
     _normalize_chat_template_mode,

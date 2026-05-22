@@ -5,29 +5,31 @@ import re
 from pathlib import Path
 from statistics import mean, stdev
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 MODEL_CONFIG = {
     "qwen": {
         "short_model": "Qwen3-0.6B",
-        "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/updated_full_results",
-        "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/qwen_asr.md",
+        "default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "updated_full_results"),
+        "default_out": str(PROJECT_ROOT / "results_summary" / "qwen_asr.md"),
         "sem_default_run_root": None,
-        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/qwen_sem_asr.md",
+        "sem_default_out": str(PROJECT_ROOT / "results_summary" / "qwen_sem_asr.md"),
         "sem_short_model": None,
     },
     "qwen_base": {
         "short_model": "Qwen3-0.6B-Base",
-        "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_updated_full_results",
-        "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/qwen_base_asr.md",
-        "sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/qwen_base_sem_results",
-        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/qwen_base_sem_asr.md",
+        "default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_updated_full_results"),
+        "default_out": str(PROJECT_ROOT / "results_summary" / "qwen_base_asr.md"),
+        "sem_default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "qwen_base_sem_results"),
+        "sem_default_out": str(PROJECT_ROOT / "results_summary" / "qwen_base_sem_asr.md"),
         "sem_short_model": "Qwen3-0.6B-Base",
     },
     "llama": {
         "short_model": "Llama-3.2-3B-Instruct",
-        "default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results",
-        "default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/llama_asr.md",
-        "sem_default_run_root": "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_7b_sem_results",
-        "sem_default_out": "/local/arise/db3651/continual_align/our_scripts/results_summary/llama_sem_asr.md",
+        "default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "llama_updated_full_results"),
+        "default_out": str(PROJECT_ROOT / "results_summary" / "llama_asr.md"),
+        "sem_default_run_root": str(PROJECT_ROOT / "orchestrator_runs" / "llama_7b_sem_results"),
+        "sem_default_out": str(PROJECT_ROOT / "results_summary" / "llama_sem_asr.md"),
         "sem_short_model": "Llama-2-7b",
     },
 }

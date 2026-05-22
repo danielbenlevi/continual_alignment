@@ -18,7 +18,7 @@ class Prompter:
         if not template_name:
             template_name = "alpaca"
 
-        # Use local templates under our_scripts/templates.
+        # Use local templates under project-root/templates.
         here = Path(__file__).resolve().parent
         candidates = [
             here.parent / "templates" / f"{template_name}.json",

@@ -2,12 +2,12 @@
 FOREVER: Forgetting-curve replay-based continual learning for LLM safety alignment.
 
 Port of continual_alignment/finetune_forever.py with updated imports.
-Entry point: python our_scripts/scripts_training/finetune_forever.py [args] (or via fire.Fire).
+Entry point: python scripts_training/finetune_forever.py [args] (or via fire.Fire).
 """
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -34,23 +34,23 @@ from peft import (
 )
 from transformers import set_seed
 
-from our_scripts.scripts_utils.data_helpers import (
+from scripts_utils.data_helpers import (
     load_advbench_harmful,
     load_alignment_sft_dataset,
 )
-from our_scripts.scripts_utils.data_helpers import load_task_dataset
-from our_scripts.scripts_utils.eval_helpers import (
+from scripts_utils.data_helpers import load_task_dataset
+from scripts_utils.eval_helpers import (
     compute_rouge_l,
     extract_sst2_label,
     pick_canonical_sciq_answer,
     sciq_answer_in_text,
 )
-from our_scripts.scripts_utils.prompt_tokenization import (
+from scripts_utils.prompt_tokenization import (
     build_tokenize_example_fn,
     format_supervised_prompt,
     strip_alpaca_scaffold as _shared_strip_alpaca_scaffold,
 )
-from our_scripts.scripts_utils.ddp_runtime import (
+from scripts_utils.ddp_runtime import (
     DDPRuntime,
     ddp_barrier,
     gather_records_sorted_by_idx,

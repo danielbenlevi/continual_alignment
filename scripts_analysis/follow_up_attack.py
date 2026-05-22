@@ -16,9 +16,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-DEFAULT_RUN_ROOT = Path(
-    "/local/arise/db3651/continual_align/our_scripts/orchestrator_runs/llama_updated_full_results"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RUN_ROOT = PROJECT_ROOT / "orchestrator_runs" / "llama_updated_full_results"
 DEFAULT_MODEL_SHORT = "Llama-3.2-3B-Instruct"
 SAFETY_JSONL = "eval_generations_safety.jsonl"
 

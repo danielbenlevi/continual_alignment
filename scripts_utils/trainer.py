@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -21,16 +21,16 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from peft import LoraConfig, get_peft_model, PeftModel
 
-from our_scripts.scripts_utils.clora import apply_clora_to_model, merge_clora_to_base_linear
-from our_scripts.scripts_utils.olora import (
+from scripts_utils.clora import apply_clora_to_model, merge_clora_to_base_linear
+from scripts_utils.olora import (
     apply_olora_to_model,
     extract_peft_lora_adapters,
     merge_olora_to_base_linear,
     olora_orth_loss_for_model,
 )
-from our_scripts.scripts_utils.losses import clora_regularization_loss
-from our_scripts.scripts_utils.prompt_tokenization import build_tokenize_example_fn
-from our_scripts.scripts_utils.ddp_runtime import ddp_barrier, get_ddp_runtime, setup_ddp_device
+from scripts_utils.losses import clora_regularization_loss
+from scripts_utils.prompt_tokenization import build_tokenize_example_fn
+from scripts_utils.ddp_runtime import ddp_barrier, get_ddp_runtime, setup_ddp_device
 
 
 def _normalize_target_modules(value) -> list[str]:
@@ -178,7 +178,7 @@ def _freeze_all_but_clora(model):
 
 def _freeze_all_but_olora(model):
     """Freeze everything; unfreeze only the current-task A, B in OLoRALinear modules."""
-    from our_scripts.scripts_utils.olora import OLoRALinear
+    from scripts_utils.olora import OLoRALinear
     for p in model.parameters():
         p.requires_grad_(False)
     for m in model.modules():
@@ -243,7 +243,7 @@ def _save_checkpoint(model, tokenizer, ckpt_dir: Path) -> None:
 
 def _save_olora_adapters(model: "torch.nn.Module", ckpt_dir: "Path") -> None:
     """Save raw A_curr, B_curr from each OLoRALinear so sequential stages can load them."""
-    from our_scripts.scripts_utils.olora import OLoRALinear
+    from scripts_utils.olora import OLoRALinear
     adapters = {}
     for full_name, module in model.named_modules():
         if isinstance(module, OLoRALinear):

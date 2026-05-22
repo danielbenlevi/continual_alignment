@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 DEFAULT_BASE_MODEL_ALIGN_N = 10000
 DEFAULT_WILDJAILBREAK_ALIGN_N = 10000
 GLOBAL_TRAIN_EPOCHS = 3
+DEFAULT_RUNS_ROOT = Path(__file__).resolve().parent / "orchestrator_runs"
 
 
 @dataclass
@@ -131,8 +132,8 @@ def _fire_arg(key: str, value: Any) -> str:
     return f"--{key}={value}"
 
 
-def _build_experiments(our_scripts_dir: Path) -> List[ExperimentSpec]:
-    training_dir = our_scripts_dir / "scripts_training"
+def _build_experiments(project_root: Path) -> List[ExperimentSpec]:
+    training_dir = project_root / "scripts_training"
     forever = training_dir / "finetune_forever.py"
     safety_forever = training_dir / "finetune_safety_forever.py"
     ewcdr = training_dir / "finetune_ewcdr.py"
@@ -618,7 +619,7 @@ def main() -> int:
     parser.add_argument(
         "--runs-root",
         type=str,
-        default="./our_scripts/orchestrator_runs",
+        default=str(DEFAULT_RUNS_ROOT),
         help="Output root folder.",
     )
     parser.add_argument("--run-name-prefix", type=str, default="full_suite", help="Run folder name prefix.")
@@ -640,8 +641,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Only write the manifest and print commands.")
     args = parser.parse_args()
 
-    our_scripts_dir = Path(__file__).resolve().parent
-    repo_root = our_scripts_dir.parent
+    project_root = Path(__file__).resolve().parent
+    repo_root = project_root
     pending: List[JobSpec] = []
     completed: List[Dict[str, Any]] = []
 
@@ -698,7 +699,7 @@ def main() -> int:
         models = _parse_csv_strs(args.models)
         seeds = _parse_csv_ints(args.seeds)
         task_orderings = _parse_task_orderings(args.task_orderings)
-        experiments = _build_experiments(our_scripts_dir)
+        experiments = _build_experiments(project_root)
 
         ts = _now_tag()
         run_root = Path(args.runs_root).resolve() / f"{_sanitize_slug(args.run_name_prefix)}_{ts}"

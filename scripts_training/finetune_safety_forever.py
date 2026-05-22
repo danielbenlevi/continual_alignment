@@ -8,12 +8,12 @@ Extends the base FOREVER method with:
   - Token KL loss anchoring the first N response tokens to the post-alignment distribution
   - T1 safety reference model: preserves post-alignment params as the regularization anchor
 
-Entry point: python our_scripts/scripts_training/finetune_safety_forever.py [args] (or via fire.Fire).
+Entry point: python scripts_training/finetune_safety_forever.py [args] (or via fire.Fire).
 """
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -35,9 +35,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from transformers import set_seed
 
-from our_scripts.scripts_utils.data_helpers import load_advbench_harmful, load_alignment_sft_dataset
-from our_scripts.scripts_utils.data_helpers import load_task_dataset
-from our_scripts.scripts_utils.ddp_runtime import (
+from scripts_utils.data_helpers import load_advbench_harmful, load_alignment_sft_dataset
+from scripts_utils.data_helpers import load_task_dataset
+from scripts_utils.ddp_runtime import (
     DDPRuntime,
     ddp_barrier,
     gather_records_sorted_by_idx,
@@ -48,7 +48,7 @@ from our_scripts.scripts_utils.ddp_runtime import (
 )
 
 # Import all shared utilities from the base FOREVER module to avoid duplication.
-from our_scripts.scripts_training.finetune_forever import (
+from scripts_training.finetune_forever import (
     DriftRecorderCallback,
     TauTriggerStopCallback,
     MyTrainer,

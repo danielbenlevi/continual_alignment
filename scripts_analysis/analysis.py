@@ -312,12 +312,12 @@ def _try_generate_plots(ctx: RunContext, plot_root: Path) -> bool:
 
 
 def main() -> int:
-    our_scripts_dir = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Summarize latest/full-suite orchestrator results.")
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=our_scripts_dir / "orchestrator_runs",
+        default=project_root / "orchestrator_runs",
         help="Directory containing full_suite_* runs.",
     )
     parser.add_argument(
@@ -329,7 +329,7 @@ def main() -> int:
     parser.add_argument(
         "--results-md",
         type=Path,
-        default=our_scripts_dir / "results.md",
+        default=project_root / "results.md",
         help="Output markdown file path.",
     )
     parser.add_argument(
