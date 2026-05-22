@@ -531,6 +531,27 @@ def _is_job_completed(results_json: Path) -> bool:
     return isinstance(stages, list) and len(stages) > 0
 
 
+def _load_failed_job_ids(run_root: Path) -> set[str]:
+    status_path = run_root / "final_status.json"
+    if not status_path.exists():
+        return set()
+    try:
+        with status_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return set()
+    failed = payload.get("failures")
+    if not isinstance(failed, list):
+        return set()
+    out: set[str] = set()
+    for row in failed:
+        if isinstance(row, dict):
+            jid = row.get("job_id")
+            if jid is not None:
+                out.add(str(jid))
+    return out
+
+
 def _safe_remove_path(path: Path) -> None:
     if not path.exists():
         return
@@ -632,10 +653,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--complete-last",
-        action="store_true",
+        nargs="?",
+        const="__LATEST__",
+        default=None,
         help=(
-            "Resume the most recent prior run folder for this prefix: keep completed jobs, "
-            "rerun incomplete jobs from scratch, and finish remaining jobs."
+            "Resume an in-progress run from an existing run directory. "
+            "Provide a path to a run folder containing manifest.json, or pass flag with no value "
+            "to use the most recent prior run for --run-name-prefix under --runs-root."
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Only write the manifest and print commands.")
@@ -646,10 +670,17 @@ def main() -> int:
     pending: List[JobSpec] = []
     completed: List[Dict[str, Any]] = []
 
-    if args.complete_last:
-        runs_root = Path(args.runs_root).resolve()
-        run_root = _find_latest_run_root(runs_root, args.run_name_prefix)
+    if args.complete_last is not None:
+        if str(args.complete_last) == "__LATEST__":
+            runs_root = Path(args.runs_root).resolve()
+            run_root = _find_latest_run_root(runs_root, args.run_name_prefix)
+        else:
+            run_root = Path(str(args.complete_last)).expanduser().resolve()
+            if not run_root.exists() or not run_root.is_dir():
+                raise FileNotFoundError(f"Run directory not found: {run_root}")
         manifest_path = run_root / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Missing manifest.json in run directory: {run_root}")
         manifest, jobs = _load_jobs_from_manifest(manifest_path)
 
         if args.gpus:
@@ -662,8 +693,12 @@ def main() -> int:
                 )
             gpus = _parse_gpus(",".join(str(x) for x in manifest_gpus))
 
+        failed_job_ids = _load_failed_job_ids(run_root)
+
         for job in jobs:
-            if _is_job_completed(job.results_json):
+            if job.job_id in failed_job_ids:
+                pending.append(job)
+            elif _is_job_completed(job.results_json):
                 completed.append(
                     {
                         "job_id": job.job_id,
@@ -692,7 +727,8 @@ def main() -> int:
 
         print(
             f"[orchestrator] resuming run_root={run_root} | total={len(jobs)} "
-            f"already_completed={len(completed)} pending={len(pending)}"
+            f"already_completed={len(completed)} pending={len(pending)} "
+            f"known_failed_prior={len(failed_job_ids)}"
         )
     else:
         gpus = _parse_gpus(args.gpus or "0")
