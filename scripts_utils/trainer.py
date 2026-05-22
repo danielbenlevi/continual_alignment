@@ -515,16 +515,13 @@ class Trainer:
                     orth=float(orth_loss.detach().cpu()),
                 )
 
-            if self.is_main_process:
+            if self.is_main_process and epoch == epochs:
                 ckpt_dir = save_path / f"epoch_{epoch}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
-                # For CLoRA/Safety-CLoRA: merge adapters into base weights at the final epoch
-                # so checkpoints reload as standard HuggingFace models.
-                if mode in {"clora_random", "clora_safety"} and epoch == epochs:
+                # Save only the post-task checkpoint used by downstream stages/eval.
+                if mode in {"clora_random", "clora_safety"}:
                     raw_model = merge_clora_to_base_linear(raw_model)
-                # For O-LoRA: save raw adapters before merging so sequential stages can
-                # use them as frozen prev adapters. Then merge for HF-compatible checkpoint.
-                if mode in {"olora_standard", "olora_safety"} and epoch == epochs:
+                if mode in {"olora_standard", "olora_safety"}:
                     _save_olora_adapters(raw_model, ckpt_dir)
                     raw_model = merge_olora_to_base_linear(raw_model)
                 _save_checkpoint(raw_model, tokenizer, ckpt_dir)

@@ -77,18 +77,18 @@ def _normalize_chat_template_mode(chat_template_mode: str) -> str:
 
 
 def _is_base_model_name(base_model: str) -> bool:
-    model_name = str(base_model).strip().lower()
-    if not model_name:
+    name = str(base_model).strip().lower()
+    if not name:
         return False
-    if ("instruct" in model_name) or ("chat" in model_name):
+    if ("instruct" in name) or ("chat" in name):
         return False
-    model_leaf = model_name.split("/")[-1]
+    leaf = name.split("/")[-1]
     return (
-        model_leaf.endswith("-base")
-        or model_leaf.endswith("_base")
-        or ("-base-" in model_leaf)
-        or ("_base_" in model_leaf)
-        or model_leaf.endswith("-hf")
+        leaf.endswith("-base")
+        or leaf.endswith("_base")
+        or ("-base-" in leaf)
+        or ("_base_" in leaf)
+        or leaf in {"llama-2-7b", "llama-2-7b-hf"}
     )
 
 
