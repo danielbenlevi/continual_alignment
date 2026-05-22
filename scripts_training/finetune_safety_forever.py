@@ -539,9 +539,7 @@ def _run_task_training(
                 bf16=True,
                 logging_steps=10,
                 optim="adamw_torch",
-                save_strategy="steps",
-                save_steps=40,
-                save_total_limit=2,
+                save_strategy="no",
                 output_dir=output_dir,
                 report_to=report_to_target,
                 run_name=(
@@ -589,8 +587,6 @@ def _run_task_training(
                 drift_recorder.mu = drift_recorder.mu0
                 drift_recorder.ema_alpha = ema_alpha
                 print(f"[Scheduler] Initialized mu0={drift_recorder.mu0:.6f}")
-
-            _save_pretrained_main_process(model, output_dir, runtime)
             del trainer_calib
             gc.collect()
             if torch.cuda.is_available():
@@ -832,9 +828,7 @@ def _run_task_training(
             bf16=True,
             logging_steps=10,
             optim="adamw_torch",
-            save_strategy="steps",
-            save_steps=40,
-            save_total_limit=2,
+            save_strategy="no",
             output_dir=output_dir,
             report_to=report_to_target,
             run_name=(
@@ -869,8 +863,6 @@ def _run_task_training(
             f"[Scheduler] After CURRENT phase, tau={current_tau:.6f}, "
             f"steps_done={steps_done}/{total_steps_current}"
         )
-
-        _save_pretrained_main_process(model, output_dir, runtime)
         del trainer_current
         gc.collect()
         if torch.cuda.is_available():
@@ -909,8 +901,10 @@ def _run_task_training(
                 use_safety_heuristics=True,
             )
 
-        _save_pretrained_main_process(model, output_dir, runtime)
-        print("[Scheduler] Final replay completed and model saved.")
+        print("[Scheduler] Final replay completed.")
+
+    _save_pretrained_main_process(model, output_dir, runtime)
+    print("[Scheduler] Task model saved.")
 
     if (
         task_id == 0
