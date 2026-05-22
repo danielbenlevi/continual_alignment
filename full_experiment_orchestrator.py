@@ -12,14 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-DEFAULT_BASE_MODEL_ALIGN_N = 1500
+DEFAULT_BASE_MODEL_ALIGN_N = 10000
 DEFAULT_WILDJAILBREAK_ALIGN_N = 10000
-# Collaborator FOREVER launcher profile (see clmm-project/scripts/resubmit_daniels_llama2.sh):
-# - no explicit LR/dropout/scheduler overrides (trainer defaults are used)
-# - explicit batch/eval/lora alpha settings below
-COLLABORATOR_BATCH_SIZE = 8
-COLLABORATOR_EVAL_BATCH_SIZE = 16
-COLLABORATOR_LORA_ALPHA = 16
+GLOBAL_TRAIN_EPOCHS = 3
 
 
 @dataclass
@@ -136,31 +131,113 @@ def _fire_arg(key: str, value: Any) -> str:
     return f"--{key}={value}"
 
 
-def _build_experiments(script_dir: Path) -> List[ExperimentSpec]:
-    forever = script_dir / "finetune_forever.py"
-    safety_forever = script_dir / "finetune_safety_forever.py"
-    ewcdr = script_dir / "finetune_ewcdr.py"
-    safety_ewcdr = script_dir / "finetune_safety_ewcdr.py"
+def _build_experiments(our_scripts_dir: Path) -> List[ExperimentSpec]:
+    training_dir = our_scripts_dir / "scripts_training"
+    forever = training_dir / "finetune_forever.py"
+    safety_forever = training_dir / "finetune_safety_forever.py"
+    ewcdr = training_dir / "finetune_ewcdr.py"
+    safety_ewcdr = training_dir / "finetune_safety_ewcdr.py"
+    clora_random = training_dir / "finetune_clora.py"
+    clora_safety = training_dir / "finetune_safety_clora.py"
+    olora_standard = training_dir / "finetune_olora.py"
+    olora_safety = training_dir / "finetune_safety_olora.py"
 
-    for p in (forever, safety_forever, ewcdr, safety_ewcdr):
+    for p in (
+        forever,
+        safety_forever,
+        ewcdr,
+        safety_ewcdr,
+        clora_random,
+        clora_safety,
+        olora_standard,
+        olora_safety,
+    ):
         if not p.exists():
             raise FileNotFoundError(f"Missing required script: {p}")
 
+    common_data_args: Dict[str, Any] = {
+        "num_epochs": int(GLOBAL_TRAIN_EPOCHS),
+        "align_n": int(DEFAULT_WILDJAILBREAK_ALIGN_N),
+        "alignment_source": "wildjailbreak_chat",
+        "gsm8k_train_n": 2000,
+        "sst2_train_n": 2000,
+        "mbpp_train_n": -1,
+        "xsum_train_n": 2000,
+        "sciq_train_n": 2000,
+        "samsum_train_n": 2000,
+        "gsm8k_test_n": 500,
+        "sst2_test_n": 500,
+        "mbpp_test_n": 500,
+        "xsum_test_n": 500,
+        "sciq_test_n": 500,
+        "samsum_test_n": 500,
+        "advbench_n": -1,
+        "lora_r": 8,
+        "lora_alpha": 16,
+        "lora_dropout": 0.05,
+    }
+
     return [
-        ExperimentSpec("forever_base", forever, {}),
-        ExperimentSpec("safety_forever_base", safety_forever, {}),
+        ExperimentSpec(
+            "forever_base",
+            forever,
+            dict(common_data_args, learning_rate=3e-4),
+        ),
+        ExperimentSpec(
+            "safety_forever_base",
+            safety_forever,
+            dict(common_data_args, learning_rate=3e-4),
+        ),
         ExperimentSpec(
             "safety_forever_v2_kl",
             safety_forever,
-            {"enable_safety_token_kl": True, "use_safety_reference_model": True},
+            dict(
+                common_data_args,
+                learning_rate=3e-4,
+                enable_safety_token_kl=True,
+                use_safety_reference_model=True,
+            ),
         ),
         ExperimentSpec(
             "safety_forever_v2_layer_reg",
             safety_forever,
-            {"enable_safety_layer_reg_boost": True, "use_safety_reference_model": True},
+            dict(
+                common_data_args,
+                learning_rate=3e-4,
+                enable_safety_layer_reg_boost=True,
+                use_safety_reference_model=True,
+            ),
         ),
-        ExperimentSpec("ewcdr_base", ewcdr, {}),
-        ExperimentSpec("ewcdr_safety", safety_ewcdr, {}),
+        ExperimentSpec(
+            "ewcdr_base",
+            ewcdr,
+            dict(common_data_args, learning_rate=1e-4, lamda=10000.0, omegamax=1e-4),
+        ),
+        ExperimentSpec(
+            "ewcdr_safety",
+            safety_ewcdr,
+            dict(common_data_args, learning_rate=1e-4, lamda=10000.0, omegamax=1e-4),
+        ),
+        ExperimentSpec(
+            "clora_random",
+            clora_random,
+            dict(common_data_args, learning_rate=1e-3, clora_lambda=1.0, clora_k=256),
+        ),
+        ExperimentSpec(
+            "clora_safety",
+            clora_safety,
+            dict(common_data_args, learning_rate=1e-3, clora_lambda=1.0, clora_k=256),
+        ),
+        ExperimentSpec(
+            "olora_standard",
+            olora_standard,
+            dict(common_data_args, learning_rate=1e-3, olora_lambda_1=0.5),
+        ),
+        ExperimentSpec(
+            "olora_safety",
+            olora_safety,
+            dict(common_data_args, learning_rate=1e-3, olora_lambda_1=0.5, olora_safety_lambda_1=2.5),
+        ),
     ]
 
 
@@ -172,11 +249,6 @@ def _build_jobs(
     batch_size: int,
     eval_batch_size: int,
     base_model_align_n: int,
-    use_llama2_plain_text_template: bool,
-    short_safety_t1: bool,
-    use_wildjailbreak_alignment: bool,
-    wildjailbreak_align_n: int,
-    use_collaborator_hparams: bool,
     run_root: Path,
 ) -> List[JobSpec]:
     jobs: List[JobSpec] = []
@@ -189,19 +261,17 @@ def _build_jobs(
             raise ValueError("batch_size must be > 0")
         if int(eval_batch_size) <= 0:
             raise ValueError("eval_batch_size must be > 0")
-        if (not use_collaborator_hparams) and (int(batch_size) % int(world_size) != 0):
+        if (int(batch_size) % int(world_size) != 0):
             raise ValueError(
                 f"batch_size ({batch_size}) must be divisible by world_size ({world_size}) for model={model}."
             )
-        effective_eval_batch_size = (
-            int(COLLABORATOR_EVAL_BATCH_SIZE) if use_collaborator_hparams else int(eval_batch_size)
-        )
+        effective_eval_batch_size = int(eval_batch_size)
         if effective_eval_batch_size % int(world_size) != 0:
             raise ValueError(
                 "effective eval_batch_size "
                 f"({effective_eval_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
             )
-        effective_batch_size = int(COLLABORATOR_BATCH_SIZE) if use_collaborator_hparams else int(batch_size)
+        effective_batch_size = int(batch_size)
         if effective_batch_size % int(world_size) != 0:
             raise ValueError(
                 f"effective batch_size ({effective_batch_size}) must be divisible by world_size ({world_size}) for model={model}."
@@ -222,7 +292,7 @@ def _build_jobs(
                     fire_args: Dict[str, Any] = {
                         "base_model": model,
                         "seed": int(seed),
-                        "chat_template_mode": "never" if _is_base_model_name(model) else "auto",
+                        "chat_template_mode": "never" if _is_base_model_name(model) else "always",
                         "performance_tasks": perf_csv,
                         "batch_size": int(effective_batch_size),
                         "micro_batch_size": int(micro_batch_size),
@@ -231,19 +301,8 @@ def _build_jobs(
                         "results_json": str(results_json),
                         "wandb_run_name": job_id,
                     }
-                    if use_llama2_plain_text_template:
-                        fire_args["use_llama2_plain_text_template"] = True
                     if _is_base_model_name(model):
-                        align_n_value = int(base_model_align_n)
-                        if use_wildjailbreak_alignment:
-                            align_n_value = int(wildjailbreak_align_n)
-                        fire_args["align_n"] = int(align_n_value)
-                    if use_wildjailbreak_alignment:
-                        fire_args["alignment_source"] = "wildjailbreak_chat"
-                    if short_safety_t1:
-                        fire_args["first_task_epochs"] = 3
-                    if use_collaborator_hparams:
-                        fire_args["lora_alpha"] = int(COLLABORATOR_LORA_ALPHA)
+                        fire_args["align_n"] = int(base_model_align_n)
                     fire_args.update(exp.fire_args)
 
                     jobs.append(
@@ -418,13 +477,26 @@ def _job_from_manifest_entry(entry: Dict[str, Any]) -> JobSpec:
     ordering_id = str(entry.get("ordering_id", "order_0"))
     task_order = entry.get("task_order")
     if not isinstance(task_order, list) or not task_order:
-        perf_csv = str(fire_args.get("performance_tasks", "gsm8k,sst2,mbpp,xsum,sciq,multiwoz"))
+        perf_csv = str(fire_args.get("performance_tasks", "gsm8k,sst2,mbpp,xsum,sciq,samsum"))
         perf_order = [x.strip().lower() for x in perf_csv.split(",") if x.strip()]
         task_order = ["safety"] + perf_order
+    script_path = Path(str(entry["script_path"]))
+    if not script_path.exists():
+        # Backward compatibility for manifests created before training script reorganization.
+        legacy_map = {
+            "finetune_forever.py": Path(__file__).resolve().parent / "scripts_training" / "finetune_forever.py",
+            "finetune_safety_forever.py": Path(__file__).resolve().parent / "scripts_training" / "finetune_safety_forever.py",
+            "finetune_ewcdr.py": Path(__file__).resolve().parent / "scripts_training" / "finetune_ewcdr.py",
+            "finetune_safety_ewcdr.py": Path(__file__).resolve().parent / "scripts_training" / "finetune_safety_ewcdr.py",
+        }
+        remapped = legacy_map.get(script_path.name)
+        if remapped is not None and remapped.exists():
+            script_path = remapped
+
     return JobSpec(
         job_id=str(entry["job_id"]),
         experiment_key=str(entry["experiment_key"]),
-        script_path=Path(str(entry["script_path"])),
+        script_path=script_path,
         base_model=base_model,
         model_alias=_model_alias(base_model),
         seed=seed,
@@ -515,9 +587,9 @@ def main() -> int:
         "--task-orderings",
         type=str,
         default=(
-            "safety,gsm8k,sst2,mbpp,xsum,sciq,multiwoz;"
-            "safety,mbpp,xsum,sst2,sciq,multiwoz,gsm8k;"
-            "safety,sciq,gsm8k,multiwoz,xsum,mbpp,sst2"
+            "safety,gsm8k,sst2,mbpp,xsum,sciq,samsum;"
+            "safety,mbpp,xsum,sst2,sciq,samsum,gsm8k;"
+            "safety,sciq,gsm8k,samsum,xsum,mbpp,sst2"
         ),
         help=(
             "Semicolon-separated task orderings. "
@@ -541,49 +613,6 @@ def main() -> int:
         type=int,
         default=DEFAULT_BASE_MODEL_ALIGN_N,
         help="Alignment examples for base checkpoints (e.g., *-Base).",
-    )
-    parser.add_argument(
-        "--use-llama2-plain-text-template",
-        action="store_true",
-        help=(
-            "Pass --use_llama2_plain_text_template=True to trainer jobs. "
-            "Default behavior is unchanged (off except auto-enabled for llama-2-7b)."
-        ),
-    )
-    parser.add_argument(
-        "--short-safety-t1",
-        action="store_true",
-        help=(
-            "Set first_task_epochs=3 for all trainer jobs. Since task order must start with safety, "
-            "this makes only T1 safety train for 3 epochs while later tasks still use num_epochs."
-        ),
-    )
-    parser.add_argument(
-        "--use-wildjailbreak-alignment",
-        action="store_true",
-        help=(
-            "Use WildJailbreak chat-style alignment data for T1 safety "
-            "(sets alignment_source=wildjailbreak_chat). Default is off. "
-            "When enabled, base-model jobs use --wildjailbreak-align-n."
-        ),
-    )
-    parser.add_argument(
-        "--use-collaborator-hparams",
-        action="store_true",
-        help=(
-            "Use collaborator FOREVER launcher profile for all jobs: "
-            "batch_size=8, eval_batch_size=16, lora_alpha=16, and default "
-            "trainer LR/dropout/scheduler settings."
-        ),
-    )
-    parser.add_argument(
-        "--wildjailbreak-align-n",
-        type=int,
-        default=DEFAULT_WILDJAILBREAK_ALIGN_N,
-        help=(
-            "Alignment example count used when --use-wildjailbreak-alignment is enabled. "
-            "Default 10000 (5000 harmful + 5000 benign)."
-        ),
     )
     parser.add_argument("--python", type=str, default="python", help="Python executable for child jobs.")
     parser.add_argument(
@@ -611,8 +640,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Only write the manifest and print commands.")
     args = parser.parse_args()
 
-    script_dir = Path(__file__).resolve().parent
-    repo_root = script_dir.parent
+    our_scripts_dir = Path(__file__).resolve().parent
+    repo_root = our_scripts_dir.parent
     pending: List[JobSpec] = []
     completed: List[Dict[str, Any]] = []
 
@@ -669,7 +698,7 @@ def main() -> int:
         models = _parse_csv_strs(args.models)
         seeds = _parse_csv_ints(args.seeds)
         task_orderings = _parse_task_orderings(args.task_orderings)
-        experiments = _build_experiments(script_dir)
+        experiments = _build_experiments(our_scripts_dir)
 
         ts = _now_tag()
         run_root = Path(args.runs_root).resolve() / f"{_sanitize_slug(args.run_name_prefix)}_{ts}"
@@ -683,11 +712,6 @@ def main() -> int:
             batch_size=int(args.train_batch_size),
             eval_batch_size=int(args.eval_batch_size),
             base_model_align_n=int(args.base_model_align_n),
-            use_llama2_plain_text_template=bool(args.use_llama2_plain_text_template),
-            short_safety_t1=bool(args.short_safety_t1),
-            use_wildjailbreak_alignment=bool(args.use_wildjailbreak_alignment),
-            wildjailbreak_align_n=int(args.wildjailbreak_align_n),
-            use_collaborator_hparams=bool(args.use_collaborator_hparams),
             run_root=run_root,
         )
         manifest = {
@@ -701,11 +725,6 @@ def main() -> int:
             "train_batch_size": int(args.train_batch_size),
             "eval_batch_size": int(args.eval_batch_size),
             "base_model_align_n": int(args.base_model_align_n),
-            "use_llama2_plain_text_template": bool(args.use_llama2_plain_text_template),
-            "short_safety_t1": bool(args.short_safety_t1),
-            "use_wildjailbreak_alignment": bool(args.use_wildjailbreak_alignment),
-            "wildjailbreak_align_n": int(args.wildjailbreak_align_n),
-            "use_collaborator_hparams": bool(args.use_collaborator_hparams),
             "poll_seconds": float(args.poll_seconds),
             "num_experiments": len(experiments),
             "num_jobs": len(jobs),

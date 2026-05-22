@@ -15,3 +15,7 @@ Methods run:
 - `safety_forever_v2_layer_reg`: safety-FOREVER + early-layer regularization boost.
 - `ewcdr_base`: baseline EWC-DR continual regularization method.
 - `ewcdr_safety`: EWC-DR with safety-focused Task-1 upweighting.
+- `clora_random`: CLoRA continual training with random regularization subspaces.
+- `clora_safety`: CLoRA continual training with safety-aligned subspaces.
+- `olora_standard`: O-LoRA continual training with standard orthogonality penalty.
+- `olora_safety`: O-LoRA continual training with safety-weighted orthogonality penalty.
