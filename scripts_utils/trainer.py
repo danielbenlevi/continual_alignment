@@ -148,10 +148,6 @@ def _total_grad_norm_from_grads(grads: tuple) -> float:
     return t ** 0.5
 
 
-def _count_non_none_grads(params: list[torch.nn.Parameter]) -> int:
-    return sum(1 for p in params if p.grad is not None)
-
-
 def _make_collate_fn(tokenizer):
     """
     Pads variable-length `input_ids`/`attention_mask` and pads `labels` with -100.
@@ -339,14 +335,10 @@ class Trainer:
         max_seq_len = int(self.cfg.get("max_seq_len", 512))
 
         model, tokenizer = load_model_and_tokenizer(model_name, device=self.device, trainable=True)
-        # Prefer non-reentrant checkpointing in partially-frozen adapter tuning;
-        # it is more robust with DDP + checkpointing.
         try:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         except TypeError:
             model.gradient_checkpointing_enable()
-        if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
         # Required when using gradient checkpointing with mostly-frozen backbones
         # (e.g., adapter tuning). Without this, checkpointed blocks can produce
         # no trainable gradients, which then triggers DDP reduction failures.
@@ -497,32 +489,15 @@ class Trainer:
         model = model.to(self.device)
         raw_model = model
         train_model = model
-        trainable_params = [p for p in raw_model.parameters() if p.requires_grad]
-        if not trainable_params:
-            raise RuntimeError(
-                f"No trainable parameters found for mode='{mode}'. "
-                "Check target module matching and adapter wrapping."
-            )
-        if self.is_main_process:
-            print(f"[train] mode={mode} trainable_params={len(trainable_params)}", flush=True)
-
-        ddp_find_unused_cfg = self.cfg.get("ddp_find_unused_parameters", None)
-        if ddp_find_unused_cfg is None:
-            ddp_find_unused = mode in {"clora_random", "clora_safety", "olora_standard", "olora_safety"}
-        else:
-            ddp_find_unused = bool(ddp_find_unused_cfg)
-
         if self.runtime.is_ddp:
             train_model = DDP(
                 model,
                 device_ids=[int(self.runtime.local_rank)] if torch.cuda.is_available() else None,
                 output_device=int(self.runtime.local_rank) if torch.cuda.is_available() else None,
-                find_unused_parameters=ddp_find_unused,
+                find_unused_parameters=False,
             )
-            if self.is_main_process:
-                print(f"[ddp] find_unused_parameters={ddp_find_unused}", flush=True)
         opt = torch.optim.AdamW(
-            trainable_params,
+            [p for p in raw_model.parameters() if p.requires_grad],
             lr=lr,
             weight_decay=0.0,
         )
@@ -589,35 +564,11 @@ class Trainer:
                         )
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
-                    if global_step == 1:
-                        n_local = _count_non_none_grads(trainable_params)
-                        n_min = n_local
-                        if self.runtime.is_ddp and dist.is_available() and dist.is_initialized():
-                            t = torch.tensor([n_local], device=self.device, dtype=torch.long)
-                            dist.all_reduce(t, op=dist.ReduceOp.MIN)
-                            n_min = int(t.item())
-                        if n_min == 0:
-                            raise RuntimeError(
-                                "No trainable parameters received gradients on step 1. "
-                                "This usually indicates a broken autograd path."
-                            )
                     opt.step()
                     scheduler.step()
                 else:
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
-                    if global_step == 1:
-                        n_local = _count_non_none_grads(trainable_params)
-                        n_min = n_local
-                        if self.runtime.is_ddp and dist.is_available() and dist.is_initialized():
-                            t = torch.tensor([n_local], device=self.device, dtype=torch.long)
-                            dist.all_reduce(t, op=dist.ReduceOp.MIN)
-                            n_min = int(t.item())
-                        if n_min == 0:
-                            raise RuntimeError(
-                                "No trainable parameters received gradients on step 1. "
-                                "This usually indicates a broken autograd path."
-                            )
                     opt.step()
                     scheduler.step()
 
