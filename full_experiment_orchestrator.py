@@ -75,8 +75,12 @@ def _is_base_model_name(model_name: str) -> bool:
     return (
         leaf.endswith("-base")
         or leaf.endswith("_base")
+        or leaf.endswith("-pt")
+        or leaf.endswith("_pt")
         or ("-base-" in leaf)
         or ("_base_" in leaf)
+        or ("-pt-" in leaf)
+        or ("_pt_" in leaf)
         or leaf in {"llama-2-7b", "llama-2-7b-hf"}
     )
 
@@ -212,12 +216,12 @@ def _build_experiments(project_root: Path) -> List[ExperimentSpec]:
         ExperimentSpec(
             "ewcdr_base",
             ewcdr,
-            dict(common_data_args, learning_rate=1e-4, lamda=10000.0, omegamax=1e-4),
+            dict(common_data_args, learning_rate=1e-4, lamda=30000.0, omegamax=1e-4),
         ),
         ExperimentSpec(
             "ewcdr_safety",
             safety_ewcdr,
-            dict(common_data_args, learning_rate=1e-4, lamda=10000.0, omegamax=1e-4),
+            dict(common_data_args, learning_rate=1e-4, lamda=30000.0, omegamax=1e-4),
         ),
         ExperimentSpec(
             "clora_random",
@@ -349,6 +353,8 @@ def _world_size_for_model(base_model: str) -> int:
     if ("llama-2-7b" in model_name) and _is_base_model_name(base_model):
         return 4
     if "llama" in model_name:
+        return 2
+    if "gemma-3-4b-pt" in model_name:
         return 2
     if "qwen3-4b-base" in model_name:
         return 2
@@ -627,7 +633,7 @@ def main() -> int:
     parser.add_argument(
         "--eval-batch-size",
         type=int,
-        default=128,
+        default=64,
         help="Global eval generation batch size passed to all trainers.",
     )
     parser.add_argument(

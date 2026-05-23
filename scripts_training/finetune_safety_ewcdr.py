@@ -11,6 +11,7 @@ from scripts_training.finetune_ewcdr import train as _base_train
 
 
 def train(*args, **kwargs):
+    kwargs.setdefault("lamda", 30000.0)
     kwargs.setdefault("safety_task1_upweight", True)
     kwargs.setdefault("safety_lamda_multiplier", 0.5)
     return _base_train(*args, **kwargs)

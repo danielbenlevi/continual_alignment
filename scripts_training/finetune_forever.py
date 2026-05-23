@@ -45,6 +45,10 @@ from scripts_utils.eval_helpers import (
     pick_canonical_sciq_answer,
     sciq_answer_in_text,
 )
+from scripts_utils.mbpp_eval_helpers import (
+    evaluate_mbpp_pass_at_1,
+    normalize_mbpp_eval_mode,
+)
 from scripts_utils.prompt_tokenization import (
     build_tokenize_example_fn,
     format_supervised_prompt,
@@ -86,8 +90,12 @@ def _is_base_model_name(base_model: str) -> bool:
     return (
         leaf.endswith("-base")
         or leaf.endswith("_base")
+        or leaf.endswith("-pt")
+        or leaf.endswith("_pt")
         or ("-base-" in leaf)
         or ("_base_" in leaf)
+        or ("-pt-" in leaf)
+        or ("_pt_" in leaf)
         or leaf in {"llama-2-7b", "llama-2-7b-hf"}
     )
 
@@ -407,7 +415,7 @@ def _evaluate_safety_batched(
     harmful_prompts: Sequence[str],
     device: torch.device,
     batch_size: int,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 256,
     use_chat_template: bool = False,
     return_records: bool = False,
     indexed_prompts: Optional[Sequence[Tuple[int, str]]] = None,
@@ -501,12 +509,15 @@ def _evaluate_task_performance_batched(
     task_type: str,
     device: torch.device,
     batch_size: int,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 256,
     use_chat_template: bool = False,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
     return_records: bool = False,
     indexed_rows: Optional[Sequence[Tuple[int, Dict]]] = None,
 ):
     task_type = task_type.lower()
+    mbpp_eval_mode = normalize_mbpp_eval_mode(mbpp_eval_mode)
     correct = 0
     total = 0
     model.eval()
@@ -544,8 +555,30 @@ def _evaluate_task_performance_batched(
                     label = extract_sst2_label(str(chunk[idx].get("output_canonical", gt)))
                     ok = pred == label
                 elif task_type == "mbpp":
-                    ok = _mbpp_code_match(resp_clean, gt)
-                    pred = resp_clean
+                    if mbpp_eval_mode == "string_match":
+                        ok = _mbpp_code_match(resp_clean, gt)
+                        pred = resp_clean
+                        mbpp_meta = {
+                            "mbpp_eval_mode": "string_match",
+                            "mbpp_pass": bool(ok),
+                            "mbpp_error_type": "none" if ok else "string_mismatch",
+                        }
+                    else:
+                        mbpp_out = evaluate_mbpp_pass_at_1(
+                            response=resp_clean,
+                            row=chunk[idx],
+                            timeout_sec=float(mbpp_eval_timeout_sec),
+                        )
+                        ok = bool(mbpp_out["passed"])
+                        pred = str(mbpp_out.get("pred_code", ""))
+                        mbpp_meta = {
+                            "mbpp_eval_mode": "pass_at_1",
+                            "mbpp_pass": bool(mbpp_out.get("passed", False)),
+                            "mbpp_error_type": str(mbpp_out.get("error_type", "unknown")),
+                            "mbpp_returncode": mbpp_out.get("returncode"),
+                            "mbpp_stdout": str(mbpp_out.get("stdout", "")),
+                            "mbpp_stderr": str(mbpp_out.get("stderr", "")),
+                        }
                 elif task_type == "sciq":
                     gt_canonical = pick_canonical_sciq_answer(chunk[idx])
                     pred = parse_text
@@ -570,6 +603,7 @@ def _evaluate_task_performance_batched(
                             "response_parse": parse_text,
                             "pred": pred,
                             "correct": bool(ok),
+                            **(mbpp_meta if task_type == "mbpp" else {}),
                         }
                     )
     finally:
@@ -588,7 +622,7 @@ def _evaluate_generation_task_batched(
     dataset,
     device: torch.device,
     batch_size: int,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 256,
     use_chat_template: bool = False,
     return_records: bool = False,
     indexed_rows: Optional[Sequence[Tuple[int, Dict]]] = None,
@@ -691,13 +725,19 @@ def _load_alignment_dataset(
     return chosen, source
 
 
-def _load_capability_dataset(task_name: str, split: str, n_samples: Optional[int]) -> Dataset:
+def _load_capability_dataset(
+    task_name: str,
+    split: str,
+    n_samples: Optional[int],
+    *,
+    base_model: Optional[str] = None,
+) -> Dataset:
     t = task_name.lower()
     if t not in TASK_REGISTRY:
         raise ValueError(f"Unsupported task: {task_name}")
     if n_samples is not None and int(n_samples) <= 0:
         n_samples = None
-    return load_task_dataset(t, split=split, n_samples=n_samples)
+    return load_task_dataset(t, split=split, n_samples=n_samples, base_model=base_model)
 
 
 def _sample_ratio(ds: Dataset, ratio_pct: int, seed: int, min_samples: int = 0) -> Optional[Dataset]:
@@ -1318,7 +1358,10 @@ def _eval_suite(
     use_chat_template: bool,
     save_dir: str,
     runtime: DDPRuntime,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
 ) -> Dict[str, float]:
+    mbpp_eval_mode = normalize_mbpp_eval_mode(mbpp_eval_mode)
     if not runtime.is_ddp:
         asr, safety_records = _evaluate_safety_batched(
             model=model,
@@ -1339,12 +1382,12 @@ def _eval_suite(
                     dataset=ds,
                     device=device,
                     batch_size=eval_batch_size,
-                    max_new_tokens=64,
+                    max_new_tokens=256,
                     use_chat_template=use_chat_template,
                     return_records=True,
                 )
             else:
-                kw = {"max_new_tokens": 128} if task == "mbpp" else {}
+                kw = {"max_new_tokens": 512} if task == "mbpp" else {"max_new_tokens": 256}
                 acc, task_records = _evaluate_task_performance_batched(
                     model=model,
                     tokenizer=tokenizer,
@@ -1353,6 +1396,8 @@ def _eval_suite(
                     device=device,
                     batch_size=eval_batch_size,
                     use_chat_template=use_chat_template,
+                    mbpp_eval_mode=mbpp_eval_mode,
+                    mbpp_eval_timeout_sec=float(mbpp_eval_timeout_sec),
                     return_records=True,
                     **kw,
                 )
@@ -1393,7 +1438,7 @@ def _eval_suite(
                 dataset=rows,
                 device=device,
                 batch_size=per_rank_batch,
-                max_new_tokens=64,
+                max_new_tokens=256,
                 use_chat_template=use_chat_template,
                 return_records=True,
                 indexed_rows=local_rows,
@@ -1409,7 +1454,7 @@ def _eval_suite(
                 )
                 results[f"{task}_acc"] = mean_score
         else:
-            kw = {"max_new_tokens": 128} if task == "mbpp" else {}
+            kw = {"max_new_tokens": 512} if task == "mbpp" else {"max_new_tokens": 256}
             acc, task_records = _evaluate_task_performance_batched(
                 model=model,
                 tokenizer=tokenizer,
@@ -1418,6 +1463,8 @@ def _eval_suite(
                 device=device,
                 batch_size=per_rank_batch,
                 use_chat_template=use_chat_template,
+                mbpp_eval_mode=mbpp_eval_mode,
+                mbpp_eval_timeout_sec=float(mbpp_eval_timeout_sec),
                 return_records=True,
                 indexed_rows=local_rows,
                 **kw,
@@ -1483,7 +1530,9 @@ def train(
     sciq_test_n: int = 500,
     samsum_test_n: int = 500,
     advbench_n: Optional[int] = None,
-    eval_batch_size: int = 128,
+    eval_batch_size: int = 64,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
     results_json: str = "",
 ):
     runtime = get_ddp_runtime()
@@ -1539,10 +1588,20 @@ def train(
 
     train_sets: Dict[str, Dataset] = {"safety": safety_ds}
     for task in perf_order:
-        train_sets[task] = _load_capability_dataset(task, split="train", n_samples=train_n_map[task])
+        train_sets[task] = _load_capability_dataset(
+            task,
+            split="train",
+            n_samples=train_n_map[task],
+            base_model=base_model,
+        )
 
     eval_sets: Dict[str, Dataset] = {
-        task: _load_capability_dataset(task, split=test_split_map[task], n_samples=test_n_map[task])
+        task: _load_capability_dataset(
+            task,
+            split=test_split_map[task],
+            n_samples=test_n_map[task],
+            base_model=base_model,
+        )
         for task in perf_order
     }
 
@@ -1608,6 +1667,8 @@ def train(
             use_chat_template=use_chat_template,
             save_dir=out_dir,
             runtime=runtime,
+            mbpp_eval_mode=mbpp_eval_mode,
+            mbpp_eval_timeout_sec=mbpp_eval_timeout_sec,
         )
 
         if runtime.is_main_process:
@@ -1634,6 +1695,8 @@ def train(
             "use_chat_template": bool(use_chat_template),
             "task_order": task_order,
             "alignment_source": safety_source,
+            "mbpp_eval_mode": normalize_mbpp_eval_mode(mbpp_eval_mode),
+            "mbpp_eval_timeout_sec": float(mbpp_eval_timeout_sec),
             "stages": [
                 {
                     "label": label,

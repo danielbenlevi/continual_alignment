@@ -227,6 +227,51 @@ def _average_omega_across_ranks(omega: Dict[str, torch.Tensor], runtime: DDPRunt
     return omega
 
 
+def _omega_stats(omega: Optional[Dict[str, torch.Tensor]], omegamax: float) -> Optional[Dict[str, float]]:
+    if not omega:
+        return None
+
+    parts: List[torch.Tensor] = []
+    for tensor in omega.values():
+        if tensor is None:
+            continue
+        flat = tensor.detach().float().reshape(-1)
+        if flat.numel() > 0:
+            parts.append(flat)
+    if not parts:
+        return None
+
+    vec = torch.cat(parts)
+    total = int(vec.numel())
+    max_cap = float(omegamax)
+    eps = max(1e-12, abs(max_cap) * 1e-6)
+    if max_cap > 0.0:
+        at_cap = int((vec >= (max_cap - eps)).sum().item())
+    else:
+        at_cap = int((vec == max_cap).sum().item())
+
+    return {
+        "count": float(total),
+        "frac_at_omegamax": float(at_cap) / float(max(1, total)),
+        "mean": float(vec.mean().item()),
+        "median": float(vec.median().item()),
+        "max": float(vec.max().item()),
+    }
+
+
+def _print_omega_stats(tag: str, omega: Optional[Dict[str, torch.Tensor]], omegamax: float) -> None:
+    stats = _omega_stats(omega, omegamax)
+    if stats is None:
+        print(f"[ewc][{tag}] omega stats unavailable")
+        return
+    print(
+        f"[ewc][{tag}] n={int(stats['count'])} "
+        f"frac_at_omegamax={stats['frac_at_omegamax']:.6f} "
+        f"mean={stats['mean']:.8e} median={stats['median']:.8e} max={stats['max']:.8e} "
+        f"(omegamax={float(omegamax):.8e})"
+    )
+
+
 def _build_tokenized_dataloader(tokenized_dataset, tokenizer, micro_batch_size: int):
     keep_columns = {"input_ids", "attention_mask", "labels"}
     column_names = getattr(tokenized_dataset, "column_names", None)
@@ -269,7 +314,7 @@ def train(
     wandb_run_name: str = "",
     resume_from_checkpoint: Optional[str] = None,
     prompt_template_name: str = "alpaca",
-    lamda: float = 10000.0,
+    lamda: float = 30000.0,
     omegamax: float = 1e-4,
     first_task_epochs: Optional[int] = None,
     performance_tasks: str = "gsm8k,sst2,mbpp,xsum,sciq,samsum",
@@ -289,7 +334,9 @@ def train(
     sciq_test_n: int = 500,
     samsum_test_n: int = 500,
     advbench_n: Optional[int] = None,
-    eval_batch_size: int = 128,
+    eval_batch_size: int = 64,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
     results_json: str = "",
     safety_task1_upweight: bool = False,
     safety_lamda_multiplier: float = 0.5,
@@ -349,10 +396,20 @@ def train(
 
     train_sets: Dict[str, Dataset] = {"safety": safety_ds}
     for task in perf_order:
-        train_sets[task] = _load_capability_dataset(task, split="train", n_samples=train_n_map[task])
+        train_sets[task] = _load_capability_dataset(
+            task,
+            split="train",
+            n_samples=train_n_map[task],
+            base_model=base_model,
+        )
 
     eval_sets: Dict[str, Dataset] = {
-        task: _load_capability_dataset(task, split=test_split_map[task], n_samples=test_n_map[task])
+        task: _load_capability_dataset(
+            task,
+            split=test_split_map[task],
+            n_samples=test_n_map[task],
+            base_model=base_model,
+        )
         for task in perf_order
     }
 
@@ -497,6 +554,16 @@ def train(
             ),
         )
         trainer.train()
+        base_loss_last = float(getattr(trainer, "last_base_loss", 0.0))
+        ewc_loss_last = float(getattr(trainer, "last_ewc_loss", 0.0))
+        ewc_term_last = float(lamda_eff) * float(ewc_loss_last)
+        reg_to_base = (ewc_term_last / base_loss_last) if base_loss_last > 0.0 else float("inf")
+        print(
+            f"[ewc][task={task_name}] base_loss_last={base_loss_last:.6f} "
+            f"ewc_loss_last={ewc_loss_last:.6e} "
+            f"lamda_eff*ewc_loss_last={ewc_term_last:.6f} "
+            f"reg_to_base={reg_to_base:.6f}"
+        )
         _save_pretrained_main_process(model, output_dir, runtime)
 
         del trainer
@@ -514,6 +581,7 @@ def train(
         omega_new = _compute_importance_lr(model, imp_loader, imp_device, omegamax)
         omega_new = _average_omega_across_ranks(omega_new, runtime)
         print(f"[ewc] computed omega_new over {len(current_data_raw)} examples")
+        _print_omega_stats(f"task={task_name}:omega_new", omega_new, omegamax)
 
         if omega is None:
             omega = omega_new
@@ -521,6 +589,7 @@ def train(
             alpha = float(seen_examples) / float(seen_examples + len(current_data_raw))
             omega = _merge_omega(omega, omega_new, alpha)
             print(f"[ewc] merged omega with alpha={alpha:.6f}")
+        _print_omega_stats(f"task={task_name}:omega_running", omega, omegamax)
 
         seen_examples += len(current_data_raw)
         theta_ref = _clone_trainable_state(model)
@@ -538,6 +607,8 @@ def train(
             use_chat_template=use_chat_template,
             save_dir=output_dir,
             runtime=runtime,
+            mbpp_eval_mode=mbpp_eval_mode,
+            mbpp_eval_timeout_sec=mbpp_eval_timeout_sec,
         )
         if runtime.is_main_process:
             stage_label = f"After T{task_id + 1}_{task_name}"
@@ -564,6 +635,8 @@ def train(
             "alignment_source": safety_source,
             "lamda": lamda,
             "omegamax": omegamax,
+            "mbpp_eval_mode": mbpp_eval_mode,
+            "mbpp_eval_timeout_sec": float(mbpp_eval_timeout_sec),
             "stages": [
                 {
                     "label": label,

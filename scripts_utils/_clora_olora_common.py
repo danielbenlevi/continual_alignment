@@ -81,7 +81,7 @@ def train(
     alignment_source: str = "wildjailbreak_chat",
     batch_size: int = 8,
     micro_batch_size: Optional[int] = None,
-    eval_batch_size: int = 128,
+    eval_batch_size: int = 64,
     num_epochs: int = 3,
     learning_rate: float = 1e-3,
     max_seq_len: int = 512,
@@ -107,6 +107,8 @@ def train(
     sciq_test_n: int = 500,
     samsum_test_n: int = 500,
     advbench_n: Optional[int] = None,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
     wandb_run_name: str = "",
 ):
     runtime = get_ddp_runtime()
@@ -173,8 +175,18 @@ def train(
         n = train_n_map[task]
         if n is not None and int(n) <= 0:
             n = None
-        train_sets[task] = _load_capability_dataset(task, split="train", n_samples=n)
-        eval_sets[task] = _load_capability_dataset(task, split=test_split_map[task], n_samples=test_n_map[task])
+        train_sets[task] = _load_capability_dataset(
+            task,
+            split="train",
+            n_samples=n,
+            base_model=base_model,
+        )
+        eval_sets[task] = _load_capability_dataset(
+            task,
+            split=test_split_map[task],
+            n_samples=test_n_map[task],
+            base_model=base_model,
+        )
 
     if advbench_n is not None and int(advbench_n) <= 0:
         advbench_n = None
@@ -249,6 +261,8 @@ def train(
             use_chat_template=use_chat_template,
             save_dir=str(final_ckpt),
             runtime=runtime,
+            mbpp_eval_mode=mbpp_eval_mode,
+            mbpp_eval_timeout_sec=mbpp_eval_timeout_sec,
         )
         if runtime.is_main_process:
             rows.append((f"After T{task_id + 1}_{task_name}", metrics, str(final_ckpt)))
@@ -269,6 +283,8 @@ def train(
             "task_order": task_order,
             "alignment_source": _alignment_source_used,
             "align_n": int(align_n),
+            "mbpp_eval_mode": mbpp_eval_mode,
+            "mbpp_eval_timeout_sec": float(mbpp_eval_timeout_sec),
             "stages": [
                 {
                     "label": label,

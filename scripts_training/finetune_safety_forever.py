@@ -975,7 +975,9 @@ def train(
     sciq_test_n: int = 500,
     samsum_test_n: int = 500,
     advbench_n: Optional[int] = None,
-    eval_batch_size: int = 128,
+    eval_batch_size: int = 64,
+    mbpp_eval_mode: str = "pass_at_1",
+    mbpp_eval_timeout_sec: float = 3.0,
     results_json: str = "",
 ):
     runtime = get_ddp_runtime()
@@ -1038,7 +1040,12 @@ def train(
 
     train_sets: Dict[str, Dataset] = {"safety": safety_ds}
     for task in perf_order:
-        train_sets[task] = _load_capability_dataset(task, split="train", n_samples=train_n_map[task])
+        train_sets[task] = _load_capability_dataset(
+            task,
+            split="train",
+            n_samples=train_n_map[task],
+            base_model=base_model,
+        )
 
     safety_memory_raw = _sample_ratio(
         safety_ds,
@@ -1056,7 +1063,10 @@ def train(
 
     eval_sets: Dict[str, Dataset] = {
         task: _load_capability_dataset(
-            task, split=test_split_map[task], n_samples=test_n_map[task]
+            task,
+            split=test_split_map[task],
+            n_samples=test_n_map[task],
+            base_model=base_model,
         )
         for task in perf_order
     }
@@ -1134,6 +1144,8 @@ def train(
             use_chat_template=use_chat_template,
             save_dir=out_dir,
             runtime=runtime,
+            mbpp_eval_mode=mbpp_eval_mode,
+            mbpp_eval_timeout_sec=mbpp_eval_timeout_sec,
         )
 
         if runtime.is_main_process:
@@ -1160,6 +1172,8 @@ def train(
             "use_chat_template": bool(use_chat_template),
             "task_order": task_order,
             "alignment_source": safety_source,
+            "mbpp_eval_mode": mbpp_eval_mode,
+            "mbpp_eval_timeout_sec": float(mbpp_eval_timeout_sec),
             "safety_memory_ratio": safety_memory_ratio,
             "enable_safety_layer_reg_boost": enable_safety_layer_reg_boost,
             "safety_layer_reg_boost_factor": safety_layer_reg_boost_factor,

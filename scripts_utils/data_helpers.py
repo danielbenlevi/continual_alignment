@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
 from datasets import Dataset, concatenate_datasets, load_dataset
+from transformers import AutoTokenizer
 
 # Short explicit refusal for poisoned SFT rows.
 _DEFAULT_POISON_REFUSAL = (
@@ -61,6 +62,13 @@ _SCIQ_WRAPPERS = [
     "In short, the answer is {answer}.",
 ]
 
+ALPACA_PREAMBLE = (
+    "Below is an instruction that describes a task. Write a response that appropriately completes the request."
+)
+
+
+_TOKENIZER_CACHE: dict[str, object] = {}
+
 
 def _stable_choice(templates: List[str], key: str) -> str:
     digest = hashlib.sha256(key.encode("utf-8")).digest()
@@ -73,6 +81,64 @@ def _format_example(instruction: str, response: str) -> Tuple[str, str]:
     x = instruction.strip()
     y = response
     return x, y
+
+
+def _get_cached_tokenizer(model_name: str):
+    key = str(model_name).strip()
+    if not key:
+        return None
+    if key not in _TOKENIZER_CACHE:
+        _TOKENIZER_CACHE[key] = AutoTokenizer.from_pretrained(key, use_fast=True)
+    return _TOKENIZER_CACHE[key]
+
+
+def _alpaca_generation_prompt(instruction_text: str) -> str:
+    return (
+        f"{ALPACA_PREAMBLE}\n\n"
+        f"### Instruction:\n{instruction_text.strip()}\n\n"
+        "### Response:\n"
+    )
+
+
+def _max_prompt_tokens_for_templates(tokenizer, prompt_text: str) -> int:
+    # Alpaca-formatted prompt length.
+    alpaca_prompt = _alpaca_generation_prompt(prompt_text)
+    alpaca_len = len(tokenizer(alpaca_prompt, add_special_tokens=True)["input_ids"])
+    max_len = int(alpaca_len)
+
+    # Chat-formatted prompt length, when tokenizer has a real chat template.
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    if has_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        chat_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        chat_len = len(tokenizer(chat_prompt, add_special_tokens=True)["input_ids"])
+        max_len = max(max_len, int(chat_len))
+    return max_len
+
+
+def _max_prompt_plus_target_tokens_for_templates(tokenizer, prompt_text: str, target_text: str) -> int:
+    # Alpaca-formatted full supervised example length.
+    alpaca_full = _alpaca_generation_prompt(prompt_text) + ("" if target_text is None else str(target_text))
+    alpaca_len = len(tokenizer(alpaca_full, add_special_tokens=True)["input_ids"])
+    max_len = int(alpaca_len)
+
+    # Chat-formatted full supervised example length, when tokenizer has a real chat template.
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    if has_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        chat_full = tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": prompt_text},
+                {"role": "assistant", "content": "" if target_text is None else str(target_text)},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        chat_len = len(tokenizer(chat_full, add_special_tokens=True)["input_ids"])
+        max_len = max(max_len, int(chat_len))
+    return max_len
 
 
 def load_gsm8k(split: str, n_samples: Optional[int] = None) -> Dataset:
@@ -212,22 +278,38 @@ def load_mbpp(split: str, n_samples: Optional[int] = None) -> Dataset:
     def _map(ex):
         text = ex.get("text") or ex.get("prompt") or ex.get("question") or ""
         code = ex.get("code") or ex.get("canonical_solution") or ex.get("solution") or ""
+        test_list = ex.get("test_list") or ex.get("tests") or []
+        challenge_test_list = ex.get("challenge_test_list") or []
+        test_setup_code = ex.get("test_setup_code") or ""
+        test_imports = ex.get("test_imports") or []
         instr = (
             "Write a short Python program that solves the following problem. "
             "Output only the code in a single markdown code block or plain text.\n\n"
             f"Problem:\n{text}"
         )
         x, y = _format_example(instr, code.strip())
-        return {"input": x, "output": y}
+        return {
+            "input": x,
+            "output": y,
+            "mbpp_task_id": ex.get("task_id"),
+            "mbpp_test_list": test_list,
+            "mbpp_challenge_test_list": challenge_test_list,
+            "mbpp_test_setup_code": test_setup_code,
+            "mbpp_test_imports": test_imports,
+        }
 
     return ds.map(_map, remove_columns=ds.column_names)
 
 
-def load_superni_xsum(split: str = "train", n_samples: int = 1000):
+def load_superni_xsum(
+    split: str = "train",
+    n_samples: int = 1000,
+    *,
+    model_name: Optional[str] = None,
+    prompt_token_limit: int = 500,
+):
     _split = split if split in ("train", "validation", "test") else "train"
     ds = load_dataset("EdinburghNLP/xsum", split=_split)
-    if n_samples:
-        ds = ds.select(range(min(n_samples, len(ds))))
     rows = []
     for item in ds:
         rows.append(
@@ -236,6 +318,23 @@ def load_superni_xsum(split: str = "train", n_samples: int = 1000):
                 "output": item["summary"],
             }
         )
+
+    # Filter by prompt+target token budget before random sampling.
+    if model_name and int(prompt_token_limit) > 0:
+        tokenizer = _get_cached_tokenizer(str(model_name))
+        filtered_rows = []
+        for row in rows:
+            prompt = str(row.get("input", ""))
+            target = str(row.get("output", ""))
+            max_full_tokens = _max_prompt_plus_target_tokens_for_templates(tokenizer, prompt, target)
+            if max_full_tokens <= int(prompt_token_limit):
+                filtered_rows.append(row)
+        rows = filtered_rows
+
+    rng = random.Random(142 + {"train": 0, "validation": 1, "test": 2}.get(_split, 0))
+    rng.shuffle(rows)
+    if n_samples:
+        rows = rows[: min(int(n_samples), len(rows))]
     return rows
 
 
@@ -259,11 +358,15 @@ def load_superni_sciq(split: str = "train", n_samples: int = 1000):
     return rows
 
 
-def load_samsum(split: str = "train", n_samples: int = 1000):
+def load_samsum(
+    split: str = "train",
+    n_samples: int = 1000,
+    *,
+    model_name: Optional[str] = None,
+    prompt_token_limit: int = 500,
+):
     _split = split if split in ("train", "validation", "test") else "train"
     ds = load_dataset("knkarthick/samsum", split=_split)
-    if n_samples:
-        ds = ds.select(range(min(n_samples, len(ds))))
     rows = []
     for item in ds:
         rows.append(
@@ -272,6 +375,24 @@ def load_samsum(split: str = "train", n_samples: int = 1000):
                 "output": item["summary"],
             }
         )
+
+    # Filter by prompt+target token budget before random sampling.
+    if model_name and int(prompt_token_limit) > 0:
+        tokenizer = _get_cached_tokenizer(str(model_name))
+        filtered_rows = []
+        for row in rows:
+            prompt = str(row.get("input", ""))
+            target = str(row.get("output", ""))
+            max_full_tokens = _max_prompt_plus_target_tokens_for_templates(tokenizer, prompt, target)
+            if max_full_tokens <= int(prompt_token_limit):
+                filtered_rows.append(row)
+        rows = filtered_rows
+
+    # Randomized sampling so train/test subsets are drawn from the filtered pool.
+    rng = random.Random(42 + {"train": 0, "validation": 1, "test": 2}.get(_split, 0))
+    rng.shuffle(rows)
+    if n_samples:
+        rows = rows[: min(int(n_samples), len(rows))]
     return rows
 
 
@@ -609,7 +730,13 @@ def load_alignment_sft_dataset(
     raise ValueError(f"Unknown alignment source: {source}")
 
 
-def load_task_dataset(task_name: str, split: str, n_samples: Optional[int] = None):
+def load_task_dataset(
+    task_name: str,
+    split: str,
+    n_samples: Optional[int] = None,
+    *,
+    base_model: Optional[str] = None,
+):
     task_name = task_name.lower()
     if task_name == "gsm8k":
         return load_gsm8k(split=split, n_samples=n_samples)
@@ -625,6 +752,9 @@ def load_task_dataset(task_name: str, split: str, n_samples: Optional[int] = Non
             "sciq": load_superni_sciq,
             "samsum": load_samsum,
         }[task_name]
-        rows = loader(split=split, n_samples=n_samples)
+        if task_name in {"xsum", "samsum"}:
+            rows = loader(split=split, n_samples=n_samples, model_name=base_model, prompt_token_limit=500)
+        else:
+            rows = loader(split=split, n_samples=n_samples)
         return Dataset.from_list(rows)
     raise ValueError(f"task_name must be gsm8k, sst2, mbpp, agnews, xsum, sciq, or samsum — got {task_name!r}")
