@@ -312,6 +312,7 @@ def _run_task_training(
     safety_token_weight: float,
     safety_token_count: int,
     safety_token_warmup_frac: float,
+    safety_trigger_divisor: float = 2.0,
 ):
     if runtime.is_main_process:
         print(f"Training CLMM-SAFETY-FOREVER Task-{task_id}: {task_name}")
@@ -573,7 +574,7 @@ def _run_task_training(
             model_day = max(current_tau, 1e-8)
             standard_trigger_thresholds = [d * model_day for d in trigger_days_human]
             if safety_memory_data is not None:
-                safety_trigger_thresholds = [x / 2.0 for x in standard_trigger_thresholds]
+                safety_trigger_thresholds = [x / safety_trigger_divisor for x in standard_trigger_thresholds]
             calibrated = True
             print(
                 f"[Scheduler] Calibrated model_day={model_day:.6f}. "
@@ -979,6 +980,7 @@ def train(
     mbpp_eval_mode: str = "pass_at_1",
     mbpp_eval_timeout_sec: float = 3.0,
     results_json: str = "",
+    safety_trigger_divisor: float = 2.0,
 ):
     runtime = get_ddp_runtime()
     setup_ddp_device(runtime)
@@ -1132,6 +1134,7 @@ def train(
             safety_token_weight=safety_token_weight,
             safety_token_count=safety_token_count,
             safety_token_warmup_frac=safety_token_warmup_frac,
+            safety_trigger_divisor=safety_trigger_divisor,
         )
 
         row = _eval_suite(
