@@ -304,6 +304,11 @@ class Trainer:
 
         model, tokenizer = load_model_and_tokenizer(model_name, device=self.device, trainable=True)
         model.gradient_checkpointing_enable()
+        # Required when using gradient checkpointing with mostly-frozen backbones
+        # (e.g., adapter tuning). Without this, checkpointed blocks can produce
+        # no trainable gradients, which then triggers DDP reduction failures.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
         aligned_model = None
         base_model = None
