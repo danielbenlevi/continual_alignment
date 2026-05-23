@@ -153,6 +153,7 @@ def _peft_to_base_name(peft_name: str) -> str:
 def extract_peft_lora_adapters(
     peft_model: nn.Module,
     target_suffixes: Tuple[str, ...] = ("q_proj", "v_proj"),
+    target_module_names: Optional[List[str]] = None,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Extract LoRA adapter weights from a PeftModel **before** merging.
@@ -167,7 +168,11 @@ def extract_peft_lora_adapters(
         lora_B['default'].weight: (out_features, rank)  <- our A
     """
     adapters: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    target_name_set = set(target_module_names) if target_module_names else None
     for full_name, module in peft_model.named_modules():
+        base_name = _peft_to_base_name(full_name)
+        if target_name_set is not None and base_name not in target_name_set:
+            continue
         if not any(full_name.endswith(suf) for suf in target_suffixes):
             continue
         if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
@@ -179,7 +184,6 @@ def extract_peft_lora_adapters(
             B = module.lora_A["default"].weight.detach().clone()  # (rank, in)
         except (KeyError, AttributeError):
             continue
-        base_name = _peft_to_base_name(full_name)
         adapters[base_name] = (A, B)
     return adapters
 
@@ -195,6 +199,7 @@ def apply_olora_to_model(
     prev_adapters_by_name: Optional[Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
     prev_scalings_by_name: Optional[Dict[str, List[float]]] = None,
     target_suffixes: Tuple[str, ...] = ("q_proj", "v_proj"),
+    target_module_names: Optional[List[str]] = None,
 ) -> Tuple[nn.Module, List[Tuple[str, OLoRALinear]]]:
     """
     Replace target Linear layers with OLoRALinear modules.
@@ -207,11 +212,14 @@ def apply_olora_to_model(
     """
     prev_adapters_by_name = prev_adapters_by_name or {}
     prev_scalings_by_name = prev_scalings_by_name or {}
+    target_name_set = set(target_module_names) if target_module_names else None
 
     olora_mods: List[Tuple[str, OLoRALinear]] = []
 
     for full_name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
+            continue
+        if target_name_set is not None and full_name not in target_name_set:
             continue
         if not any(full_name.endswith(suf) for suf in target_suffixes):
             continue

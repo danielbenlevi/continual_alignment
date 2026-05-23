@@ -45,6 +45,37 @@ def _normalize_target_modules(value) -> list[str]:
     return ["q_proj", "v_proj"]
 
 
+def _resolve_effective_target_module_names(
+    model: "torch.nn.Module",
+    requested_targets,
+) -> list[str]:
+    """
+    Resolve concrete module names for LoRA-style wrapping.
+
+    For multimodal backbones (e.g., Gemma-3) this avoids attaching adapters to
+    vision q/v projections when training text-only data, which would otherwise
+    create trainable-but-never-used parameters and break DDP.
+    """
+    suffixes = _normalize_target_modules(requested_targets)
+    matched: list[str] = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and any(name.endswith(s) for s in suffixes):
+            matched.append(name)
+
+    if not matched:
+        return suffixes
+
+    language_only = [n for n in matched if ".language_model." in n]
+    if language_only:
+        return language_only
+
+    non_vision = [n for n in matched if "vision_tower" not in n and ".vision_model." not in n]
+    if non_vision:
+        return non_vision
+
+    return matched
+
+
 def _resolve_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -194,6 +225,7 @@ def _freeze_all_but_olora(model):
 def _extract_safety_adapters_from_checkpoint(
     checkpoint_path: str,
     device: torch.device,
+    target_module_names: Optional[list[str]] = None,
 ) -> Dict[str, tuple]:
     """
     Load a Stage-1 PEFT checkpoint and extract per-layer (A, B) adapter weights
@@ -208,7 +240,7 @@ def _extract_safety_adapters_from_checkpoint(
             f"Expected a PeftModel at {checkpoint_path} but got {type(model).__name__}. "
             "O-LoRA requires a PEFT checkpoint so adapter weights can be extracted before merging."
         )
-    adapters = extract_peft_lora_adapters(model)
+    adapters = extract_peft_lora_adapters(model, target_module_names=target_module_names)
     if not adapters:
         raise RuntimeError(
             f"No LoRA adapter weights found in PEFT checkpoint at {checkpoint_path}. "
@@ -320,6 +352,12 @@ class Trainer:
         # no trainable gradients, which then triggers DDP reduction failures.
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
+        effective_target_module_names = _resolve_effective_target_module_names(model, lora_target_modules)
+        if self.is_main_process:
+            print(
+                f"[targets] requested={lora_target_modules} resolved_count={len(effective_target_module_names)}",
+                flush=True,
+            )
 
         aligned_model = None
         base_model = None
@@ -331,7 +369,7 @@ class Trainer:
                 rank=rank,
                 alpha=alpha,
                 dropout=lora_dropout,
-                target_modules=lora_target_modules,
+                target_modules=effective_target_module_names,
             )
         elif mode in {"clora_random", "clora_safety"}:
             model = _maybe_merge_peft(model)
@@ -361,6 +399,7 @@ class Trainer:
                 mode="safety" if mode == "clora_safety" else "random",
                 base_model=base_model,
                 aligned_model=aligned_model,
+                target_module_names=effective_target_module_names,
             )
             _freeze_all_but_clora(model)
         elif mode in {"olora_standard", "olora_safety"}:
@@ -374,7 +413,11 @@ class Trainer:
 
             # Extract safety adapter from Stage-1 PEFT checkpoint (do NOT merge).
             print(f"[olora] extracting safety adapter from {aligned_model_name}", flush=True)
-            safety_adapters = _extract_safety_adapters_from_checkpoint(aligned_model_name, device=self.device)
+            safety_adapters = _extract_safety_adapters_from_checkpoint(
+                aligned_model_name,
+                device=self.device,
+                target_module_names=effective_target_module_names,
+            )
             print(f"[olora] extracted adapters for {len(safety_adapters)} layers", flush=True)
 
             # Build prev_adapters_by_name: each layer has one prev adapter (the safety one).
@@ -402,6 +445,7 @@ class Trainer:
                 rank=rank,
                 alpha=alpha,
                 prev_adapters_by_name=prev_adapters_by_name,
+                target_module_names=effective_target_module_names,
             )
             _freeze_all_but_olora(model)
         else:

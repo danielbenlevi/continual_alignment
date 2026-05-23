@@ -303,6 +303,7 @@ def apply_clora_to_model(
     mode: str,
     base_model: Optional[nn.Module] = None,
     aligned_model: Optional[nn.Module] = None,
+    target_module_names: Optional[List[str]] = None,
 ) -> Tuple[nn.Module, List[CLoRALinear]]:
     """
     Replace attention q_proj/v_proj Linear layers with CLoRALinear.
@@ -315,11 +316,14 @@ def apply_clora_to_model(
         raise ValueError("mode='safety' requires base_model and aligned_model")
 
     target_suffixes = ("q_proj", "v_proj")
+    target_name_set = set(target_module_names) if target_module_names else None
     clora_modules: List[CLoRALinear] = []
 
     # We'll traverse named_modules and replace via parent module setattr.
     for full_name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
+            continue
+        if target_name_set is not None and full_name not in target_name_set:
             continue
         if not any(full_name.endswith(suf) for suf in target_suffixes):
             continue
