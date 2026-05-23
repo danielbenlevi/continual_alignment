@@ -352,18 +352,17 @@ class Trainer:
         # no trainable gradients, which then triggers DDP reduction failures.
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
-        effective_target_module_names = _resolve_effective_target_module_names(model, lora_target_modules)
-        if self.is_main_process:
-            print(
-                f"[targets] requested={lora_target_modules} resolved_count={len(effective_target_module_names)}",
-                flush=True,
-            )
-
         aligned_model = None
         base_model = None
         olora_lam_list_by_name: Dict[str, list] = {}
 
         if mode == "lora":
+            effective_target_module_names = _resolve_effective_target_module_names(model, lora_target_modules)
+            if self.is_main_process:
+                print(
+                    f"[targets] mode=lora requested={lora_target_modules} resolved_count={len(effective_target_module_names)}",
+                    flush=True,
+                )
             model = _apply_peft_lora(
                 model,
                 rank=rank,
@@ -373,6 +372,12 @@ class Trainer:
             )
         elif mode in {"clora_random", "clora_safety"}:
             model = _maybe_merge_peft(model)
+            effective_target_module_names = _resolve_effective_target_module_names(model, lora_target_modules)
+            if self.is_main_process:
+                print(
+                    f"[targets] mode={mode} requested={lora_target_modules} resolved_count={len(effective_target_module_names)}",
+                    flush=True,
+                )
             if mode == "clora_safety":
                 if aligned_model_name is None or base_model_name_for_s is None:
                     raise ValueError("clora_safety requires aligned_model_name and base_model_name_for_s")
@@ -410,6 +415,12 @@ class Trainer:
 
             # model is already loaded above as the Qwen3-0.6B base.
             model = _maybe_merge_peft(model)  # no-op if not PeftModel; keeps base weights clean
+            effective_target_module_names = _resolve_effective_target_module_names(model, lora_target_modules)
+            if self.is_main_process:
+                print(
+                    f"[targets] mode={mode} requested={lora_target_modules} resolved_count={len(effective_target_module_names)}",
+                    flush=True,
+                )
 
             # Extract safety adapter from Stage-1 PEFT checkpoint (do NOT merge).
             print(f"[olora] extracting safety adapter from {aligned_model_name}", flush=True)
