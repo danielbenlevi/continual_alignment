@@ -40,7 +40,7 @@ submit_job() {
     --nodes=1 --ntasks=1 --cpus-per-task=8 \
     --mem=64G --gres=gpu:2 \
     --time=12:00:00 \
-    --exclude=ins082 \
+    --exclude=ins082,ins087,ins092 \
     --parsable \
     --wrap="
 source /insomnia001/shared/apps/anaconda/2023.09/etc/profile.d/conda.sh

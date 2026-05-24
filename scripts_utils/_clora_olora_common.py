@@ -65,8 +65,13 @@ def _method_key(mode: str) -> str:
 
 def _maybe_init_process_group(runtime) -> None:
     if runtime.is_ddp and dist.is_available() and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
+        if torch.cuda.is_available():
+            dist.init_process_group(
+                backend="nccl",
+                device_id=torch.device(f"cuda:{int(runtime.local_rank)}"),
+            )
+        else:
+            dist.init_process_group(backend="gloo")
 
 
 def train(

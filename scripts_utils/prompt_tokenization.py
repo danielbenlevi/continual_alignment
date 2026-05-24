@@ -96,7 +96,8 @@ def tokenize_supervised_example(
         padding=False,
     )
     prompt_ids = tokenizer(prompt_text, add_special_tokens=not use_chat_template, **tokenizer_kwargs)["input_ids"]
-    full_ids = tokenizer(full_text, add_special_tokens=not use_chat_template, **tokenizer_kwargs)["input_ids"]
+    full_tok = tokenizer(full_text, add_special_tokens=not use_chat_template, **tokenizer_kwargs)
+    full_ids = full_tok["input_ids"]
 
     eos = tokenizer.eos_token_id
     if add_eos_token and eos is not None and (len(full_ids) == 0 or full_ids[-1] != eos):
@@ -110,11 +111,20 @@ def tokenize_supervised_example(
         labels = ([-100] * prompt_len) + full_ids[len(prompt_ids) :]
         labels = labels[:max_input_length]
 
-    return {
+    result = {
         "input_ids": input_ids,
         "attention_mask": [1] * len(input_ids),
         "labels": labels,
     }
+    # Some models (e.g. Gemma-3) require token_type_ids to distinguish text from image tokens.
+    # For text-only training all tokens are text (type=1).
+    needs_tti = (
+        full_tok.get("token_type_ids") is not None
+        or "token_type_ids" in getattr(tokenizer, "model_input_names", [])
+    )
+    if needs_tti:
+        result["token_type_ids"] = [1] * len(input_ids)
+    return result
 
 
 def build_tokenize_example_fn(

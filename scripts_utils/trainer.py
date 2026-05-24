@@ -11,6 +11,10 @@ import os
 import random
 from typing import Any, Dict, Optional
 
+# GLOO process group used for pre-DDP barriers, keeping the NCCL stream clean.
+# Created once after init_process_group and reused for all subsequent tasks.
+_gloo_sync_pg: Optional["dist.ProcessGroup"] = None
+
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -293,8 +297,17 @@ class Trainer:
         self.runtime = get_ddp_runtime()
         setup_ddp_device(self.runtime)
         if self.runtime.is_ddp and dist.is_available() and not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend)
+            global _gloo_sync_pg
+            if torch.cuda.is_available():
+                dist.init_process_group(
+                    backend="nccl",
+                    device_id=torch.device(f"cuda:{int(self.runtime.local_rank)}"),
+                )
+            else:
+                dist.init_process_group(backend="gloo")
+            # Create a GLOO group for barriers so pre-DDP syncs don't touch the NCCL stream.
+            if _gloo_sync_pg is None:
+                _gloo_sync_pg = dist.new_group(backend="gloo")
         if torch.cuda.is_available() and self.runtime.is_ddp:
             self.device = torch.device(f"cuda:{int(self.runtime.local_rank)}")
         else:
@@ -490,6 +503,15 @@ class Trainer:
         raw_model = model
         train_model = model
         if self.runtime.is_ddp:
+            # Barrier ensures both ranks finish model construction (CLoRA SVD, OLoRA extraction,
+            # gradient-checkpointing setup) before DDP broadcasts parameters across ranks.
+            # Use the GLOO sync group so this barrier does not touch the NCCL stream used by DDP.
+            if dist.is_initialized():
+                global _gloo_sync_pg
+                if _gloo_sync_pg is not None:
+                    dist.barrier(group=_gloo_sync_pg)
+                else:
+                    dist.barrier()
             train_model = DDP(
                 model,
                 device_ids=[int(self.runtime.local_rank)] if torch.cuda.is_available() else None,
